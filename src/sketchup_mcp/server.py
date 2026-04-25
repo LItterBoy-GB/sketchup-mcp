@@ -156,11 +156,14 @@ class SketchupConnection:
                 
                 response = json.loads(response_data.decode('utf-8'))
                 logger.info(f"Response parsed: {response}")
-                
+
+                if not isinstance(response, dict):
+                    return response
+
                 if "error" in response:
                     logger.error(f"Sketchup error: {response['error']}")
                     raise Exception(response["error"].get("message", "Unknown error from Sketchup"))
-                
+
                 return response.get("result", {})
                 
             except (socket.timeout, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
@@ -248,7 +251,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 # Create MCP server with lifespan support
 mcp = FastMCP(
     "SketchupMCP",
-    description="Sketchup integration through the Model Context Protocol",
+    instructions="Sketchup integration through the Model Context Protocol",
     lifespan=server_lifespan
 )
 
