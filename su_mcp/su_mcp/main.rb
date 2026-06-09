@@ -8,11 +8,18 @@ SKETCHUP_CONSOLE.show rescue nil
 
 module SU_MCP
   class Server
+    DEFAULT_PORT = 9876
+    SETTINGS_NAMESPACE = "SU_MCP"
+    SETTINGS_PORT_KEY = "port"
+
+    attr_reader :port
+
     def initialize
-      @port = 9876
+      @port = self.class.load_port
       @server = nil
       @running = false
       @timer_id = nil
+      @port_command = nil
       
       # Try multiple ways to show console
       begin
@@ -26,6 +33,16 @@ module SU_MCP
       end
     end
 
+    def self.load_port
+      stored_port = Sketchup.read_default(SETTINGS_NAMESPACE, SETTINGS_PORT_KEY, DEFAULT_PORT)
+      port = stored_port.to_i
+      valid_port?(port) ? port : DEFAULT_PORT
+    end
+
+    def self.valid_port?(port)
+      port.is_a?(Integer) && port >= 1 && port <= 65_535
+    end
+
     def log(msg)
       begin
         SKETCHUP_CONSOLE.write("MCP: #{msg}\n")
@@ -35,8 +52,54 @@ module SU_MCP
       STDOUT.flush
     end
 
+    def port_menu_text
+      "Current Port: #{@port}"
+    end
+
+    def attach_port_command(command)
+      @port_command = command
+      update_port_menu_text
+    end
+
+    def show_current_port
+      UI.messagebox("Current MCP port: #{@port}")
+    end
+
+    def configure_port
+      input = UI.inputbox(["MCP Port"], [@port.to_s], "Sketchup MCP Port")
+      return unless input
+
+      new_port = parse_port(input.first)
+      unless new_port
+        UI.messagebox("Port must be an integer from 1 to 65535.")
+        return
+      end
+
+      if new_port == @port
+        update_port_menu_text
+        show_current_port
+        return
+      end
+
+      was_running = @running
+      stop if was_running
+
+      @port = new_port
+      Sketchup.write_default(SETTINGS_NAMESPACE, SETTINGS_PORT_KEY, @port)
+      update_port_menu_text
+      log "Configured server port #{@port}"
+
+      if was_running
+        if start
+          UI.messagebox("MCP server port changed to #{@port}.")
+        else
+          UI.messagebox("MCP server port was saved, but the server could not start on #{@port}.")
+        end
+      end
+    end
+
     def start
-      return if @running
+      return true if @running
       
       begin
         log "Starting server on localhost:#{@port}..."
@@ -122,11 +185,13 @@ module SU_MCP
         }
         
         log "Server started and listening"
+        true
         
       rescue StandardError => e
         log "Error: #{e.message}"
         log e.backtrace.join("\n")
         stop
+        false
       end
     end
 
@@ -145,6 +210,22 @@ module SU_MCP
     end
 
     private
+
+    def parse_port(value)
+      text = value.to_s.strip
+      return nil unless text =~ /\A\d+\z/
+
+      port = text.to_i
+      self.class.valid_port?(port) ? port : nil
+    end
+
+    def update_port_menu_text
+      return unless @port_command && @port_command.respond_to?(:menu_text=)
+
+      @port_command.menu_text = port_menu_text
+    rescue StandardError => e
+      log "Failed to update port menu text: #{e.message}"
+    end
 
     def handle_jsonrpc_request(request)
       log "Handling JSONRPC request: #{request.inspect}"
@@ -1852,6 +1933,11 @@ module SU_MCP
     @server = Server.new
     
     menu = UI.menu("Plugins").add_submenu("MCP Server")
+    current_port_command = UI::Command.new(@server.port_menu_text) { @server.show_current_port }
+    @server.attach_port_command(current_port_command)
+    menu.add_item(current_port_command)
+    menu.add_item("Set Port...") { @server.configure_port }
+    menu.add_separator
     menu.add_item("Start Server") { @server.start }
     menu.add_item("Stop Server") { @server.stop }
     

@@ -3,6 +3,7 @@ import socket
 import json
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
@@ -15,6 +16,10 @@ logger = logging.getLogger("SketchupMCPServer")
 # Define version directly to avoid pkg_resources dependency
 __version__ = "0.1.17"
 logger.info(f"SketchupMCP Server version {__version__} starting up")
+
+DEFAULT_SKETCHUP_HOST = "localhost"
+DEFAULT_SKETCHUP_PORT = 9876
+SKETCHUP_PORT_ENV = "SKETCHUP_MCP_PORT"
 
 @dataclass
 class SketchupConnection:
@@ -195,9 +200,49 @@ class SketchupConnection:
 # Global connection management
 _sketchup_connection = None
 
+def get_sketchup_host() -> str:
+    return DEFAULT_SKETCHUP_HOST
+
+def get_sketchup_port() -> int:
+    raw_port = os.environ.get(SKETCHUP_PORT_ENV)
+    if raw_port is None or raw_port.strip() == "":
+        return DEFAULT_SKETCHUP_PORT
+
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError(f"{SKETCHUP_PORT_ENV} must be an integer from 1 to 65535") from exc
+
+    if port < 1 or port > 65535:
+        raise ValueError(f"{SKETCHUP_PORT_ENV} must be an integer from 1 to 65535")
+    return port
+
 def get_sketchup_connection():
     """Get or create a persistent Sketchup connection"""
     global _sketchup_connection
+
+    target_host = get_sketchup_host()
+    target_port = get_sketchup_port()
+
+    if (
+        _sketchup_connection is not None
+        and (
+            _sketchup_connection.host != target_host
+            or _sketchup_connection.port != target_port
+        )
+    ):
+        # 端口可能通过环境变量切换，旧连接不能继续复用。
+        logger.info(
+            "Sketchup connection target changed from %s:%s to %s:%s; reconnecting",
+            _sketchup_connection.host,
+            _sketchup_connection.port,
+            target_host,
+            target_port,
+        )
+        try:
+            _sketchup_connection.disconnect()
+        finally:
+            _sketchup_connection = None
     
     if _sketchup_connection is not None:
         try:
@@ -219,11 +264,14 @@ def get_sketchup_connection():
             _sketchup_connection = None
     
     if _sketchup_connection is None:
-        _sketchup_connection = SketchupConnection(host="localhost", port=9876)
+        _sketchup_connection = SketchupConnection(host=target_host, port=target_port)
         if not _sketchup_connection.connect():
-            logger.error("Failed to connect to Sketchup")
+            logger.error("Failed to connect to Sketchup at %s:%s", target_host, target_port)
             _sketchup_connection = None
-            raise Exception("Could not connect to Sketchup. Make sure the Sketchup extension is running.")
+            raise Exception(
+                "Could not connect to Sketchup. Make sure the Sketchup extension is "
+                f"running on {target_host}:{target_port}."
+            )
         logger.info("Created new persistent connection to Sketchup")
     
     return _sketchup_connection

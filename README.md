@@ -41,6 +41,40 @@ We're using uv so you'll need to ```brew install uv```
 2. The server will start on the default port (9876)
 3. Make sure the MCP server is running in your terminal
 
+### Using Multiple Sketchup Instances
+
+Each Sketchup instance runs its own local TCP server. To connect multiple
+instances at the same time, give each Sketchup instance a different port:
+
+1. In Sketchup, go to Extensions > MCP Server > Set Port...
+2. Enter a port such as `9876`, `9877`, or `9878`
+3. Use the Current Port menu item to confirm the active port
+4. Start the server from Extensions > MCP Server > Start Server
+5. Start the matching MCP server with the same port
+
+PowerShell example:
+
+```powershell
+$env:SKETCHUP_MCP_PORT = "9877"
+uvx sketchup-mcp
+```
+
+Claude configuration can also pass the port as an environment variable:
+
+```json
+{
+  "mcpServers": {
+    "sketchup-9877": {
+      "command": "uvx",
+      "args": ["sketchup-mcp"],
+      "env": {
+        "SKETCHUP_MCP_PORT": "9877"
+      }
+    }
+  }
+}
+```
+
 ### Using with Claude
 
 Configure Claude to use the MCP server by adding the following to your Claude configuration:
