@@ -455,6 +455,60 @@ def export_scene(
         return f"Error exporting scene: {str(e)}"
 
 @mcp.tool()
+def capture_review_views(
+    ctx: Context,
+    persistent_id: int,
+    output_dir: str = "",
+    hide_others: bool = True,
+    width: int = 1600,
+    height: int = 1200
+) -> str:
+    """Capture isolated front/right/top review images for an entity by persistent_id."""
+    try:
+        logger.info(
+            "capture_review_views called with persistent_id=%s, output_dir=%s, "
+            "hide_others=%s, width=%s, height=%s",
+            persistent_id,
+            output_dir,
+            hide_others,
+            width,
+            height,
+        )
+
+        sketchup = get_sketchup_connection()
+
+        result = sketchup.send_command(
+            method="tools/call",
+            params={
+                "name": "capture_review_views",
+                "arguments": {
+                    "persistent_id": persistent_id,
+                    "output_dir": output_dir,
+                    "hide_others": hide_others,
+                    "width": width,
+                    "height": height,
+                },
+            },
+            request_id=ctx.request_id,
+        )
+
+        logger.info(f"capture_review_views result: {result}")
+
+        response = {
+            "success": True,
+            "result": result.get("content", [{"text": "Success"}])[0].get("text", "Success")
+            if isinstance(result.get("content"), list) and len(result.get("content", [])) > 0
+            else "Success",
+        }
+        return json.dumps(response)
+    except Exception as e:
+        logger.error(f"Error in capture_review_views: {str(e)}")
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
+
+@mcp.tool()
 def create_mortise_tenon(
     ctx: Context,
     mortise_id: str,

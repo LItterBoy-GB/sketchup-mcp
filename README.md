@@ -37,7 +37,7 @@ We're using uv so you'll need to ```brew install uv```
 
 ### Starting the Connection
 
-1. In Sketchup, go to Extensions > SketchupMCP > Start Server
+1. In Sketchup, go to Extensions > MCP Server > Start Server
 2. The server will start on the default port (9876)
 3. Make sure the MCP server is running in your terminal
 
@@ -75,6 +75,21 @@ Claude configuration can also pass the port as an environment variable:
 }
 ```
 
+### Direct CLI
+
+For debugging or scripting, use `sketchup-mcp-cli` to call the Sketchup Ruby
+extension directly without going through an MCP host:
+
+```powershell
+sketchup-mcp-cli --port 9877 ping
+sketchup-mcp-cli --port 9877 eval "Sketchup.active_model.title"
+sketchup-mcp-cli --port 9877 eval --file .\probe.rb
+sketchup-mcp-cli --port 9877 call get_selection
+```
+
+Use `eval --file` for larger Ruby snippets or when shell quoting would make an
+inline string fragile.
+
 ### Using with Claude
 
 Configure Claude to use the MCP server by adding the following to your Claude configuration:
@@ -96,13 +111,16 @@ Once connected, Claude can interact with Sketchup using the following capabiliti
 
 #### Tools
 
-* `get_scene_info` - Gets information about the current Sketchup scene
-* `get_selected_components` - Gets information about currently selected components
+* `get_selection` - Gets information about currently selected components
 * `create_component` - Create a new component with specified parameters
 * `delete_component` - Remove a component from the scene
 * `transform_component` - Move, rotate, or scale a component
 * `set_material` - Apply materials to components
 * `export_scene` - Export the current scene to various formats
+* `capture_review_views` - Capture front, right, and top review images for a top-level entity
+* `create_mortise_tenon` - Create a mortise and tenon joint between two boards
+* `create_dovetail` - Create a dovetail joint between two boards
+* `create_finger_joint` - Create a finger joint between two boards
 * `eval_ruby` - Execute arbitrary Ruby code in SketchUp for advanced operations
 
 ### Example Commands

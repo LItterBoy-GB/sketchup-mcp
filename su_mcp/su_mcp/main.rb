@@ -309,6 +309,8 @@ module SU_MCP
           get_selection
         when "export", "export_scene"
           export_scene(args)
+        when "capture_review_views"
+          capture_review_views(args)
         when "set_material"
           set_material(args)
         when "boolean_operation"
@@ -772,6 +774,114 @@ module SU_MCP
         log "Error in export_scene: #{e.message}"
         log e.backtrace.join("\n")
         raise
+      end
+    end
+
+    def capture_review_views(params)
+      log "Capturing review views with params: #{params.inspect}"
+      model = Sketchup.active_model
+      raise "No active model" unless model
+
+      persistent_id = params["persistent_id"].to_i
+      raise "persistent_id is required" if persistent_id <= 0
+
+      target = model.find_entity_by_persistent_id(persistent_id)
+      raise "Entity not found for persistent_id=#{persistent_id}" unless target
+
+      unless target.respond_to?(:bounds)
+        raise "Target entity does not support bounds"
+      end
+      unless model.entities.include?(target)
+        raise "capture_review_views only supports top-level model entities"
+      end
+
+      output_dir = params["output_dir"].to_s.strip
+      if output_dir.empty?
+        output_dir = File.join(ENV["TEMP"] || ENV["TMP"] || Dir.tmpdir, "sketchup_review_views")
+      end
+      FileUtils.mkdir_p(output_dir)
+
+      width = (params["width"] || 1600).to_i
+      height = (params["height"] || 1200).to_i
+      hide_others = params.key?("hide_others") ? !!params["hide_others"] : true
+
+      view = model.active_view
+      original_camera = view.camera
+      original_eye = original_camera.eye
+      original_target = original_camera.target
+      original_up = original_camera.up
+      original_perspective = original_camera.perspective?
+
+      hidden_states = {}
+      timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+      base_name = "review_#{persistent_id}_#{timestamp}"
+
+      begin
+        if hide_others
+          model.entities.each do |entity|
+            next unless entity.respond_to?(:hidden?) && entity.respond_to?(:hidden=)
+            hidden_states[entity.persistent_id] = entity.hidden?
+            entity.hidden = entity != target
+          end
+        end
+
+        bounds = target.bounds
+        center = bounds.center
+        width_span = [bounds.width, 1.mm].max
+        depth_span = [bounds.depth, 1.mm].max
+        height_span = [bounds.height, 1.mm].max
+        padding = [width_span, depth_span, height_span].max * 1.8
+
+        captures = {}
+        [
+          ["front", Geom::Point3d.new(center.x, center.y - padding, center.z), Geom::Vector3d.new(0, 0, 1)],
+          ["right", Geom::Point3d.new(center.x + padding, center.y, center.z), Geom::Vector3d.new(0, 0, 1)],
+          ["top", Geom::Point3d.new(center.x, center.y, center.z + padding), Geom::Vector3d.new(0, 1, 0)]
+        ].each do |name, eye, up|
+          camera = Sketchup::Camera.new(eye, center, up, false)
+          view.camera = camera
+          view.zoom(target)
+          view.invalidate
+
+          path = File.join(output_dir, "#{base_name}_#{name}.png")
+          unless view.write_image(
+            filename: path,
+            width: width,
+            height: height,
+            antialias: true,
+            transparent: false
+          )
+            raise "Failed to write review image: #{path}"
+          end
+          captures[name] = path
+        end
+
+        result = {
+          persistent_id: persistent_id,
+          name: target.respond_to?(:name) ? target.name : "",
+          bounds: {
+            min: [bounds.min.x, bounds.min.y, bounds.min.z],
+            max: [bounds.max.x, bounds.max.y, bounds.max.z]
+          },
+          images: captures
+        }
+
+        {
+          success: true,
+          result: JSON.generate(result)
+        }
+      ensure
+        if hide_others
+          model.entities.each do |entity|
+            next unless entity.respond_to?(:hidden?) && entity.respond_to?(:hidden=)
+            next unless hidden_states.key?(entity.persistent_id)
+            entity.hidden = hidden_states[entity.persistent_id]
+          end
+        end
+
+        restored_camera = Sketchup::Camera.new(original_eye, original_target, original_up, original_perspective)
+        view.camera = restored_camera
+        view.invalidate
       end
     end
     
