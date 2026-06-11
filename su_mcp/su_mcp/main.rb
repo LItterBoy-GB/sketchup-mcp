@@ -82,6 +82,20 @@ module SU_MCP
       end
 
       was_running = @running
+      if set_port(new_port)
+        UI.messagebox("MCP server port changed to #{@port}.") if was_running
+      else
+        UI.messagebox("MCP server port was saved, but the server could not start on #{@port}.")
+      end
+    end
+
+    def set_port(port)
+      new_port = parse_port(port)
+      raise ArgumentError, "Port must be an integer from 1 to 65535." unless new_port
+
+      return true if new_port == @port
+
+      was_running = @running
       stop if was_running
 
       @port = new_port
@@ -89,13 +103,7 @@ module SU_MCP
       update_port_menu_text
       log "Configured server port #{@port}"
 
-      if was_running
-        if start
-          UI.messagebox("MCP server port changed to #{@port}.")
-        else
-          UI.messagebox("MCP server port was saved, but the server could not start on #{@port}.")
-        end
-      end
+      was_running ? start : true
     end
 
     def start
@@ -2039,8 +2047,18 @@ module SU_MCP
     end
   end
 
+  def self.server
+    @server ||= Server.new
+  end
+
+  def self.start_server(port = nil)
+    @server = server
+    @server.set_port(port) if port
+    @server.start
+  end
+
   unless file_loaded?(__FILE__)
-    @server = Server.new
+    @server = server
     
     menu = UI.menu("Plugins").add_submenu("MCP Server")
     current_port_command = UI::Command.new(@server.port_menu_text) { @server.show_current_port }

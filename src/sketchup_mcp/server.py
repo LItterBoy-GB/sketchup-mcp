@@ -4,9 +4,12 @@ import json
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
+
+from . import startup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -21,13 +24,15 @@ DEFAULT_SKETCHUP_HOST = "localhost"
 DEFAULT_SKETCHUP_PORT = 9876
 SKETCHUP_PORT_ENV = "SKETCHUP_MCP_PORT"
 
+_sketchup_port_override = None
+
 @dataclass
 class SketchupConnection:
     host: str
     port: int
     sock: socket.socket = None
     
-    def connect(self) -> bool:
+    def connect(self, allow_autostart: bool = True) -> bool:
         """Connect to the Sketchup extension socket server"""
         if self.sock:
             try:
@@ -39,7 +44,28 @@ class SketchupConnection:
                 # Connection is dead, close it and reconnect
                 logger.info("Connection test failed, reconnecting...")
                 self.disconnect()
-            
+
+        if self._connect_once():
+            return True
+
+        if allow_autostart and startup.maybe_start_sketchup(self.port):
+            logger.info("Sketchup autostart requested; waiting for port %s", self.port)
+            if self._connect_once():
+                return True
+
+            startup_timeout = startup.get_startup_timeout()
+            if startup_timeout <= 0:
+                return False
+
+            deadline = time.monotonic() + startup_timeout
+            while time.monotonic() <= deadline:
+                time.sleep(0.5)
+                if self._connect_once():
+                    return True
+
+        return False
+
+    def _connect_once(self) -> bool:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
@@ -204,20 +230,44 @@ def get_sketchup_host() -> str:
     return DEFAULT_SKETCHUP_HOST
 
 def get_sketchup_port() -> int:
+    if _sketchup_port_override is not None:
+        return _sketchup_port_override
+
     raw_port = os.environ.get(SKETCHUP_PORT_ENV)
     if raw_port is None or raw_port.strip() == "":
         return DEFAULT_SKETCHUP_PORT
 
+    return _parse_sketchup_port(raw_port, SKETCHUP_PORT_ENV)
+
+def _parse_sketchup_port(value: Any, source: str) -> int:
     try:
-        port = int(raw_port)
-    except ValueError as exc:
-        raise ValueError(f"{SKETCHUP_PORT_ENV} must be an integer from 1 to 65535") from exc
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} must be an integer from 1 to 65535") from exc
 
     if port < 1 or port > 65535:
-        raise ValueError(f"{SKETCHUP_PORT_ENV} must be an integer from 1 to 65535")
+        raise ValueError(f"{source} must be an integer from 1 to 65535")
     return port
 
-def get_sketchup_connection():
+def set_sketchup_port_override(port: Any) -> int:
+    global _sketchup_port_override, _sketchup_connection
+
+    parsed_port = _parse_sketchup_port(port, "port")
+    _sketchup_port_override = parsed_port
+
+    if _sketchup_connection is not None and _sketchup_connection.port != parsed_port:
+        try:
+            _sketchup_connection.disconnect()
+        finally:
+            _sketchup_connection = None
+
+    return parsed_port
+
+def clear_sketchup_port_override():
+    global _sketchup_port_override
+    _sketchup_port_override = None
+
+def get_sketchup_connection(allow_autostart: bool = True):
     """Get or create a persistent Sketchup connection"""
     global _sketchup_connection
 
@@ -265,12 +315,18 @@ def get_sketchup_connection():
     
     if _sketchup_connection is None:
         _sketchup_connection = SketchupConnection(host=target_host, port=target_port)
-        if not _sketchup_connection.connect():
+        if not _sketchup_connection.connect(allow_autostart=allow_autostart):
             logger.error("Failed to connect to Sketchup at %s:%s", target_host, target_port)
             _sketchup_connection = None
+            permission_hint = (
+                " Ask the user whether to start SketchUp. If the user agrees, call "
+                "`allow_sketchup_autostart` and retry the SketchUp tool call."
+            )
+            if allow_autostart and startup.autostart_allowed():
+                permission_hint = ""
             raise Exception(
                 "Could not connect to Sketchup. Make sure the Sketchup extension is "
-                f"running on {target_host}:{target_port}."
+                f"running on {target_host}:{target_port}.{permission_hint}"
             )
         logger.info("Created new persistent connection to Sketchup")
     
@@ -282,7 +338,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     try:
         logger.info("SketchupMCP server starting up")
         try:
-            sketchup = get_sketchup_connection()
+            sketchup = get_sketchup_connection(allow_autostart=False)
             logger.info("Successfully connected to Sketchup on startup")
         except Exception as e:
             logger.warning(f"Could not connect to Sketchup on startup: {str(e)}")
@@ -304,6 +360,32 @@ mcp = FastMCP(
 )
 
 # Tool endpoints
+@mcp.tool()
+def allow_sketchup_autostart(ctx: Context, allowed: bool = True) -> str:
+    """Allow this MCP server process to start SketchUp when the Ruby port is unreachable."""
+    startup.set_session_autostart_allowed(allowed)
+    return json.dumps({
+        "success": True,
+        "autostart_allowed": startup.autostart_allowed(),
+        "session_autostart_allowed": bool(allowed),
+    })
+
+@mcp.tool()
+def set_connection_port(ctx: Context, port: int) -> str:
+    """Set the Sketchup Ruby extension port for this MCP server process."""
+    try:
+        target_port = set_sketchup_port_override(port)
+        return json.dumps({
+            "success": True,
+            "host": get_sketchup_host(),
+            "port": target_port,
+        })
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+        })
+
 @mcp.tool()
 def create_component(
     ctx: Context,

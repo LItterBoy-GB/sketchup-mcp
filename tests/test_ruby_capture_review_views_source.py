@@ -18,6 +18,13 @@ class RubyCaptureReviewViewsSourceTests(unittest.TestCase):
         self.assertIn("unless view.write_image(", source)
         self.assertIn("Failed to write review image", source)
 
+    def test_ruby_startup_can_start_server_on_requested_port(self):
+        source = RUBY_MAIN.read_text(encoding="utf-8")
+
+        self.assertIn("def self.start_server(port = nil)", source)
+        self.assertIn("@server.set_port(port) if port", source)
+        self.assertIn("@server.start", source)
+
 
 if __name__ == "__main__":
     unittest.main()

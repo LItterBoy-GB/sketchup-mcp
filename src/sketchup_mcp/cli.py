@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Sequence, TextIO
 
+from . import startup
+
 DEFAULT_SKETCHUP_HOST = "localhost"
 DEFAULT_SKETCHUP_PORT = 9876
 SKETCHUP_PORT_ENV = "SKETCHUP_MCP_PORT"
@@ -54,6 +56,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=_port,
         default=None,
         help=f"Sketchup Ruby extension port, defaults to SKETCHUP_MCP_PORT or {DEFAULT_SKETCHUP_PORT}",
+    )
+    parser.add_argument(
+        "--start-sketchup-if-needed",
+        action="store_true",
+        help="Start SketchUp with -RubyStartup if the Ruby MCP port is not reachable",
+    )
+    parser.add_argument(
+        "--sketchup-exe",
+        default=None,
+        help=f"Path to SketchUp.exe, defaults to auto-discovery or {startup.SKETCHUP_EXE_ENV}",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=None,
+        help=f"Seconds to wait for SketchUp autostart, defaults to {startup.STARTUP_TIMEOUT_ENV} or {startup.DEFAULT_STARTUP_TIMEOUT:g}",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -117,6 +135,17 @@ def _connection(args: argparse.Namespace) -> Any:
     return _connection_class()(host=host, port=port)
 
 
+def apply_startup_options(args: argparse.Namespace) -> None:
+    if args.start_sketchup_if_needed:
+        os.environ[startup.AUTOSTART_ENV] = "1"
+    if args.sketchup_exe:
+        os.environ[startup.SKETCHUP_EXE_ENV] = args.sketchup_exe
+    if args.startup_timeout is not None:
+        if args.startup_timeout <= 0:
+            raise ValueError("startup timeout must be a positive number")
+        os.environ[startup.STARTUP_TIMEOUT_ENV] = str(args.startup_timeout)
+
+
 def _write_json(stdout: TextIO, payload: Any) -> None:
     stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -130,6 +159,7 @@ def main(
     connection = None
 
     try:
+        apply_startup_options(args)
         connection = _connection(args)
         if args.command == "ping":
             connected = connection.connect()

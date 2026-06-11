@@ -31,6 +31,20 @@ class CliEvalTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cli.parse_args(["eval", "1 + 1", "--file", str(script_path)])
 
+    def test_start_sketchup_options_are_parsed(self):
+        args = cli.parse_args([
+            "--start-sketchup-if-needed",
+            "--sketchup-exe",
+            r"C:\Program Files\SketchUp\SketchUp 2026\SketchUp.exe",
+            "--startup-timeout",
+            "12",
+            "ping",
+        ])
+
+        self.assertTrue(args.start_sketchup_if_needed)
+        self.assertEqual(args.sketchup_exe, r"C:\Program Files\SketchUp\SketchUp 2026\SketchUp.exe")
+        self.assertEqual(args.startup_timeout, 12.0)
+
     def test_eval_sends_eval_ruby_tool_call(self):
         sent = {}
 
@@ -81,6 +95,16 @@ class CliEvalTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("port must be an integer from 1 to 65535", json.loads(stderr.getvalue())["error"])
+
+    def test_invalid_startup_timeout_returns_json_error(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        exit_code = cli.main(["--startup-timeout", "-1", "ping"], stdout=stdout, stderr=stderr)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("startup timeout must be a positive number", json.loads(stderr.getvalue())["error"])
 
 
 if __name__ == "__main__":
