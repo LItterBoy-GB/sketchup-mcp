@@ -128,9 +128,9 @@ module SU_MCP
                 log "Client accepted"
                 
                 data = read_client_payload(client)
-                log "Raw data: #{data.inspect}"
                 
                 if data
+                  log "Raw data: #{data.inspect}"
                   begin
                     # Parse the raw JSON first to check format
                     raw_request = JSON.parse(data)
@@ -236,7 +236,10 @@ module SU_MCP
 
     def read_client_payload(client)
       first_line = client.gets
-      return nil unless first_line
+      unless first_line
+        log "Client closed before sending a request"
+        return nil
+      end
 
       match = first_line.match(/\AContent-Length:\s*(\d+)\s*\z/i)
       return first_line unless match
@@ -249,6 +252,9 @@ module SU_MCP
       return nil if length <= 0
 
       client.read(length)
+    rescue EOFError, Errno::ECONNRESET => e
+      log "Client closed before sending a request: #{e.message}"
+      nil
     end
 
     def write_json_response(client, response)
@@ -342,6 +348,8 @@ module SU_MCP
 
       begin
         result = case tool_name
+        when "ping"
+          { success: true, result: "pong" }
         when "create_component"
           create_component(args)
         when "delete_component"

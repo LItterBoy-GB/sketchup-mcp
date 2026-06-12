@@ -44,6 +44,19 @@ class RubyCaptureReviewViewsSourceTests(unittest.TestCase):
         self.assertIn('body.bytesize', source)
         self.assertIn('write_json_response(client, response)', source)
 
+    def test_empty_probe_connections_are_ignored(self):
+        source = RUBY_MAIN.read_text(encoding="utf-8")
+
+        self.assertIn('rescue EOFError, Errno::ECONNRESET', source)
+        self.assertIn('Client closed before sending a request', source)
+        self.assertIn('return nil', source)
+
+    def test_ping_tool_is_supported(self):
+        source = RUBY_MAIN.read_text(encoding="utf-8")
+
+        self.assertIn('when "ping"', source)
+        self.assertIn('{ success: true, result: "pong" }', source)
+
 
 if __name__ == "__main__":
     unittest.main()

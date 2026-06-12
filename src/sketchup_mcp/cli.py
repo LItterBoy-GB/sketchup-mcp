@@ -162,16 +162,16 @@ def main(
         apply_startup_options(args)
         connection = _connection(args)
         if args.command == "ping":
-            connected = connection.connect()
+            connection.send_command("ping", {}, request_id=1)
             _write_json(
                 stdout,
                 {
-                    "success": connected,
+                    "success": True,
                     "host": connection.host,
                     "port": connection.port,
                 },
             )
-            return 0 if connected else 1
+            return 0
 
         if args.command == "eval":
             result = connection.send_command(

@@ -50,6 +50,8 @@ class CliEvalTests(unittest.TestCase):
 
         class FakeConnection:
             def __init__(self, host, port):
+                self.host = host
+                self.port = port
                 sent["host"] = host
                 sent["port"] = port
 
@@ -74,6 +76,41 @@ class CliEvalTests(unittest.TestCase):
         self.assertEqual(sent["request_id"], 1)
         self.assertTrue(sent["disconnected"])
         self.assertEqual(json.loads(stdout.getvalue()), {"success": True, "content": [{"text": "2"}]})
+
+    def test_ping_sends_protocol_request_instead_of_connect_probe(self):
+        sent = {}
+
+        class FakeConnection:
+            def __init__(self, host, port):
+                self.host = host
+                self.port = port
+                sent["host"] = host
+                sent["port"] = port
+
+            def connect(self):
+                raise AssertionError("ping should send a protocol request")
+
+            def send_command(self, method, params=None, request_id=None):
+                sent["method"] = method
+                sent["params"] = params
+                sent["request_id"] = request_id
+                return {"success": True}
+
+            def disconnect(self):
+                sent["disconnected"] = True
+
+        stdout = io.StringIO()
+        with patch.object(cli, "SketchupConnection", FakeConnection):
+            exit_code = cli.main(["--host", "127.0.0.1", "--port", "9877", "ping"], stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sent["host"], "127.0.0.1")
+        self.assertEqual(sent["port"], 9877)
+        self.assertEqual(sent["method"], "ping")
+        self.assertEqual(sent["params"], {})
+        self.assertEqual(sent["request_id"], 1)
+        self.assertTrue(sent["disconnected"])
+        self.assertEqual(json.loads(stdout.getvalue()), {"success": True, "host": "127.0.0.1", "port": 9877})
 
     def test_call_help_mentions_existing_tool(self):
         stdout = io.StringIO()
