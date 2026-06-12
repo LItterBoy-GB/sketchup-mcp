@@ -1,4 +1,5 @@
 import unittest
+import json
 from unittest.mock import patch
 
 from sketchup_mcp import server
@@ -8,6 +9,12 @@ class ConnectionConfigTests(unittest.TestCase):
     def tearDown(self):
         server.clear_sketchup_port_override()
         server.startup.clear_session_autostart_allowed()
+        if server._sketchup_connection is not None:
+            try:
+                server._sketchup_connection.disconnect()
+            except Exception:
+                pass
+            server._sketchup_connection = None
 
     def test_default_connection_target_uses_default_port(self):
         self.assertEqual(server.get_sketchup_host(), "localhost")
@@ -83,6 +90,92 @@ class ConnectionConfigTests(unittest.TestCase):
         with patch.object(server.SketchupConnection, "_connect_once", return_value=False):
             with self.assertRaisesRegex(Exception, "Ask the user whether to start SketchUp"):
                 server.get_sketchup_connection()
+
+    def test_cached_connection_is_returned_without_probe_ping(self):
+        calls = []
+
+        class FakeSocket:
+            def sendall(self, payload):
+                calls.append(payload)
+
+            def close(self):
+                pass
+
+        cached = server.SketchupConnection(host="localhost", port=9876, sock=FakeSocket())
+        server._sketchup_connection = cached
+
+        self.assertIs(server.get_sketchup_connection(), cached)
+        self.assertEqual(calls, [])
+
+    def test_request_metadata_includes_sent_at_and_timeout(self):
+        sent = {}
+
+        class FakeSocket:
+            def settimeout(self, timeout):
+                sent["timeout"] = timeout
+
+            def sendall(self, payload):
+                sent["payload"] = payload
+                header, body = payload.split(b"\r\n\r\n", 1)
+                sent["header"] = header.decode("utf-8")
+                sent["request"] = json.loads(body.decode("utf-8"))
+
+        connection = server.SketchupConnection(host="localhost", port=9876, sock=FakeSocket())
+
+        with (
+            patch.object(connection, "connect", return_value=True),
+            patch.object(connection, "receive_full_response", return_value=b'{"result":{"success":true}}'),
+            patch("sketchup_mcp.server.time.time", return_value=1_780_000_000.123),
+        ):
+            connection.send_command("get_selection", request_id=7)
+
+        self.assertEqual(sent["request"]["_mcp"]["sent_at_ms"], 1_780_000_000_123)
+        self.assertEqual(sent["request"]["_mcp"]["timeout_ms"], server.DEFAULT_REQUEST_TIMEOUT_MS)
+        self.assertRegex(sent["header"], r"Content-Length: \d+")
+        self.assertEqual(sent["timeout"], server.DEFAULT_REQUEST_TIMEOUT_MS / 1000)
+
+    def test_receive_full_response_accepts_content_length_frame(self):
+        body = b'{"result":{"success":true}}'
+        payload = b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+
+        class FakeSocket:
+            def __init__(self):
+                self._payload = payload
+
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, buffer_size):
+                if not self._payload:
+                    return b""
+                chunk = self._payload[:buffer_size]
+                self._payload = self._payload[buffer_size:]
+                return chunk
+
+        connection = server.SketchupConnection(host="localhost", port=9876)
+
+        self.assertEqual(connection.receive_full_response(FakeSocket(), buffer_size=8), body)
+
+    def test_receive_full_response_still_accepts_legacy_json(self):
+        payload = b'{"result":{"success":true}}\n'
+
+        class FakeSocket:
+            def __init__(self):
+                self._payload = payload
+
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, buffer_size):
+                if not self._payload:
+                    return b""
+                chunk = self._payload[:buffer_size]
+                self._payload = self._payload[buffer_size:]
+                return chunk
+
+        connection = server.SketchupConnection(host="localhost", port=9876)
+
+        self.assertEqual(connection.receive_full_response(FakeSocket(), buffer_size=8), payload)
 
 
 if __name__ == "__main__":

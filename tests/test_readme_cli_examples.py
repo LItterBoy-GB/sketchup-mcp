@@ -44,10 +44,17 @@ class ReadmeCliExamplesTests(unittest.TestCase):
 
         self.assertIn("SKETCHUP_MCP_AUTOSTART", readme)
         self.assertIn("SKETCHUP_MCP_SKETCHUP_EXE", readme)
+        self.assertIn("SKETCHUP_MCP_REQUEST_TIMEOUT_MS", readme)
         self.assertIn("ask the user whether", readme)
         self.assertIn("allow_sketchup_autostart", readme)
         self.assertIn("set_connection_port", readme)
         self.assertIn("--start-sketchup-if-needed", readme)
+
+    def test_tcp_protocol_framing_is_documented(self):
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn("Content-Length", readme)
+        self.assertIn("legacy one-line JSON", readme)
 
 
 if __name__ == "__main__":

@@ -127,7 +127,7 @@ module SU_MCP
                 client = @server.accept_nonblock
                 log "Client accepted"
                 
-                data = client.gets
+                data = read_client_payload(client)
                 log "Raw data: #{data.inspect}"
                 
                 if data
@@ -150,33 +150,32 @@ module SU_MCP
                       request["id"] = original_id
                       log "Added missing ID: #{original_id}"
                     end
-                    
-                    log "Processed request: #{request.inspect}"
-                    response = handle_jsonrpc_request(request)
-                    response_json = response.to_json + "\n"
-                    
-                    log "Sending response: #{response_json.strip}"
-                    client.write(response_json)
-                    client.flush
-                    log "Response sent"
+
+                    if request_expired?(request)
+                      log "Dropped expired request: #{request.inspect}"
+                    else
+                      log "Processed request: #{request.inspect}"
+                      response = handle_jsonrpc_request(request)
+                      log "Sending response: #{response.inspect}"
+                      write_json_response(client, response)
+                      log "Response sent"
+                    end
                   rescue JSON::ParserError => e
                     log "JSON parse error: #{e.message}"
                     error_response = {
                       jsonrpc: "2.0",
                       error: { code: -32700, message: "Parse error" },
                       id: original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
+                    }
+                    write_json_response(client, error_response)
                   rescue StandardError => e
                     log "Request error: #{e.message}"
                     error_response = {
                       jsonrpc: "2.0",
                       error: { code: -32603, message: e.message },
                       id: request ? request["id"] : original_id
-                    }.to_json + "\n"
-                    client.write(error_response)
-                    client.flush
+                    }
+                    write_json_response(client, error_response)
                   end
                 end
                 
@@ -233,6 +232,42 @@ module SU_MCP
       @port_command.menu_text = port_menu_text
     rescue StandardError => e
       log "Failed to update port menu text: #{e.message}"
+    end
+
+    def read_client_payload(client)
+      first_line = client.gets
+      return nil unless first_line
+
+      match = first_line.match(/\AContent-Length:\s*(\d+)\s*\z/i)
+      return first_line unless match
+
+      length = match[1].to_i
+      while (line = client.gets)
+        break if line == "\r\n" || line == "\n"
+      end
+
+      return nil if length <= 0
+
+      client.read(length)
+    end
+
+    def write_json_response(client, response)
+      body = response.to_json
+      client.write("Content-Length: #{body.bytesize}\r\n\r\n")
+      client.write(body)
+      client.flush
+    end
+
+    def request_expired?(request)
+      meta = request["_mcp"]
+      return false unless meta.is_a?(Hash)
+
+      sent_at_ms = meta["sent_at_ms"].to_f
+      timeout_ms = meta["timeout_ms"].to_f
+      return false if sent_at_ms <= 0 || timeout_ms <= 0
+
+      age_ms = (Time.now.to_f * 1000.0) - sent_at_ms
+      age_ms > timeout_ms
     end
 
     def handle_jsonrpc_request(request)

@@ -95,6 +95,7 @@ SKETCHUP_MCP_PORT = "9876"
 SKETCHUP_MCP_AUTOSTART = "1"
 SKETCHUP_MCP_SKETCHUP_EXE = "C:\\Program Files\\SketchUp\\SketchUp 2026\\SketchUp.exe"
 SKETCHUP_MCP_STARTUP_TIMEOUT = "45"
+SKETCHUP_MCP_REQUEST_TIMEOUT_MS = "15000"
 ```
 
 Autostart runs only after the user has approved it, either through
@@ -102,6 +103,11 @@ Autostart runs only after the user has approved it, either through
 `SKETCHUP_MCP_AUTOSTART=1` pre-approval setting. The MCP server startup probe
 does not launch Sketchup, so a conversation can call `set_connection_port` first
 when it needs a non-default port.
+
+Every Python-to-Sketchup request includes a send timestamp and
+`SKETCHUP_MCP_REQUEST_TIMEOUT_MS`. If Sketchup is busy and only handles the
+socket after that timeout has elapsed, the Ruby extension drops the stale
+request without executing it.
 
 For a second Sketchup instance, add another server name and a different port:
 
@@ -134,7 +140,8 @@ For a project-local setup, create `opencode.json` in the project root:
       "environment": {
         "SKETCHUP_MCP_PORT": "9876",
         "SKETCHUP_MCP_AUTOSTART": "1",
-        "SKETCHUP_MCP_SKETCHUP_EXE": "C:\\Program Files\\SketchUp\\SketchUp 2026\\SketchUp.exe"
+        "SKETCHUP_MCP_SKETCHUP_EXE": "C:\\Program Files\\SketchUp\\SketchUp 2026\\SketchUp.exe",
+        "SKETCHUP_MCP_REQUEST_TIMEOUT_MS": "15000"
       }
     }
   }
@@ -254,10 +261,13 @@ Here are some examples of what you can ask your MCP client to do:
 
 ### Communication Protocol
 
-The system uses a simple JSON-based protocol over TCP sockets:
+The Python connector and Sketchup Ruby extension exchange JSON-RPC payloads over
+TCP sockets:
 
-* **Commands** are sent as JSON objects with a `type` and optional `params`
-* **Responses** are JSON objects with a `status` and `result` or `message`
+* New requests and responses use `Content-Length: <bytes>\r\n\r\n<json>` framing.
+* The Ruby extension still accepts legacy one-line JSON requests for compatibility.
+* Requests include `_mcp.sent_at_ms` and `_mcp.timeout_ms`; expired requests are
+  dropped by the Ruby extension before tool dispatch.
 
 ## Contributing
 

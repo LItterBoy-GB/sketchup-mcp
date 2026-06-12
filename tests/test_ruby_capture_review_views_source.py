@@ -25,6 +25,25 @@ class RubyCaptureReviewViewsSourceTests(unittest.TestCase):
         self.assertIn("@server.set_port(port) if port", source)
         self.assertIn("@server.start", source)
 
+    def test_expired_requests_are_dropped_before_tool_dispatch(self):
+        source = RUBY_MAIN.read_text(encoding="utf-8")
+
+        self.assertIn('def request_expired?(request)', source)
+        self.assertIn('request["_mcp"]', source)
+        self.assertIn('if request_expired?(request)', source)
+        self.assertIn('Dropped expired request', source)
+
+    def test_content_length_framing_is_supported(self):
+        source = RUBY_MAIN.read_text(encoding="utf-8")
+
+        self.assertIn('def read_client_payload(client)', source)
+        self.assertIn('Content-Length:', source)
+        self.assertIn('return first_line', source)
+        self.assertIn('client.read(length)', source)
+        self.assertIn('def write_json_response(client, response)', source)
+        self.assertIn('body.bytesize', source)
+        self.assertIn('write_json_response(client, response)', source)
+
 
 if __name__ == "__main__":
     unittest.main()

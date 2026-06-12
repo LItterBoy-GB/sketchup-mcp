@@ -23,8 +23,42 @@ logger.info(f"SketchupMCP Server version {__version__} starting up")
 DEFAULT_SKETCHUP_HOST = "localhost"
 DEFAULT_SKETCHUP_PORT = 9876
 SKETCHUP_PORT_ENV = "SKETCHUP_MCP_PORT"
+DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+REQUEST_TIMEOUT_ENV = "SKETCHUP_MCP_REQUEST_TIMEOUT_MS"
+CONTENT_LENGTH_PREFIX = b"Content-Length:"
 
 _sketchup_port_override = None
+
+def _frame_json_payload(payload: bytes) -> bytes:
+    return f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii") + payload
+
+def _looks_like_framed_response(data: bytes) -> bool:
+    prefix = CONTENT_LENGTH_PREFIX.lower()
+    lowered = data.lower()
+    return lowered.startswith(prefix) or prefix.startswith(lowered)
+
+def _extract_framed_body(data: bytes) -> bytes | None:
+    header_end = data.find(b"\r\n\r\n")
+    if header_end == -1:
+        return None
+
+    header = data[:header_end].decode("ascii", errors="replace")
+    content_length = None
+    for line in header.split("\r\n"):
+        name, separator, value = line.partition(":")
+        if separator and name.strip().lower() == "content-length":
+            content_length = int(value.strip())
+            break
+
+    if content_length is None or content_length < 0:
+        raise ValueError("Missing or invalid Content-Length header")
+
+    body_start = header_end + len(b"\r\n\r\n")
+    body_end = body_start + content_length
+    if len(data) < body_end:
+        return None
+
+    return data[body_start:body_end]
 
 @dataclass
 class SketchupConnection:
@@ -89,7 +123,7 @@ class SketchupConnection:
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        sock.settimeout(15.0)
+        sock.settimeout(get_request_timeout_ms() / 1000)
         
         try:
             while True:
@@ -104,6 +138,13 @@ class SketchupConnection:
                     
                     try:
                         data = b''.join(chunks)
+                        if _looks_like_framed_response(data):
+                            body = _extract_framed_body(data)
+                            if body is None:
+                                continue
+                            logger.info(f"Received complete framed response ({len(body)} bytes)")
+                            return body
+
                         json.loads(data.decode('utf-8'))
                         logger.info(f"Received complete response ({len(data)} bytes)")
                         return data
@@ -124,6 +165,12 @@ class SketchupConnection:
         if chunks:
             data = b''.join(chunks)
             logger.info(f"Returning data after receive completion ({len(data)} bytes)")
+            if _looks_like_framed_response(data):
+                body = _extract_framed_body(data)
+                if body is None:
+                    raise Exception("Incomplete framed response received")
+                return body
+
             try:
                 json.loads(data.decode('utf-8'))
                 return data
@@ -171,16 +218,21 @@ class SketchupConnection:
         
         while retry_count <= max_retries:
             try:
+                request["_mcp"] = {
+                    "sent_at_ms": int(time.time() * 1000),
+                    "timeout_ms": get_request_timeout_ms(),
+                }
                 logger.info(f"Sending JSON-RPC request: {request}")
                 
                 # Log the exact bytes being sent
-                request_bytes = json.dumps(request).encode('utf-8') + b'\n'
+                request_body = json.dumps(request).encode('utf-8')
+                request_bytes = _frame_json_payload(request_body)
                 logger.info(f"Raw bytes being sent: {request_bytes}")
                 
                 self.sock.sendall(request_bytes)
                 logger.info(f"Request sent, waiting for response...")
                 
-                self.sock.settimeout(15.0)
+                self.sock.settimeout(get_request_timeout_ms() / 1000)
                 
                 response_data = self.receive_full_response(self.sock)
                 logger.info(f"Received {len(response_data)} bytes of data")
@@ -239,6 +291,20 @@ def get_sketchup_port() -> int:
 
     return _parse_sketchup_port(raw_port, SKETCHUP_PORT_ENV)
 
+def get_request_timeout_ms() -> int:
+    raw_timeout = os.environ.get(REQUEST_TIMEOUT_ENV)
+    if raw_timeout is None or raw_timeout.strip() == "":
+        return DEFAULT_REQUEST_TIMEOUT_MS
+
+    try:
+        timeout_ms = int(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{REQUEST_TIMEOUT_ENV} must be a positive integer") from exc
+
+    if timeout_ms <= 0:
+        raise ValueError(f"{REQUEST_TIMEOUT_ENV} must be a positive integer")
+    return timeout_ms
+
 def _parse_sketchup_port(value: Any, source: str) -> int:
     try:
         port = int(value)
@@ -295,23 +361,7 @@ def get_sketchup_connection(allow_autostart: bool = True):
             _sketchup_connection = None
     
     if _sketchup_connection is not None:
-        try:
-            # Test connection with a ping command
-            ping_request = {
-                "jsonrpc": "2.0",
-                "method": "ping",
-                "params": {},
-                "id": 0
-            }
-            _sketchup_connection.sock.sendall(json.dumps(ping_request).encode('utf-8') + b'\n')
-            return _sketchup_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _sketchup_connection.disconnect()
-            except:
-                pass
-            _sketchup_connection = None
+        return _sketchup_connection
     
     if _sketchup_connection is None:
         _sketchup_connection = SketchupConnection(host=target_host, port=target_port)
