@@ -39,10 +39,27 @@ class RubyCaptureReviewViewsSourceTests(unittest.TestCase):
         self.assertIn('def read_client_payload(client)', source)
         self.assertIn('Content-Length:', source)
         self.assertIn('return first_line', source)
-        self.assertIn('client.read(length)', source)
+        self.assertIn('read_bytes_with_timeout(client, length, CLIENT_READ_TIMEOUT_SEC)', source)
         self.assertIn('def write_json_response(client, response)', source)
         self.assertIn('body.bytesize', source)
         self.assertIn('write_json_response(client, response)', source)
+
+    def test_client_reads_are_bounded(self):
+        source = RUBY_MAIN.read_text(encoding="utf-8")
+
+        self.assertIn('CLIENT_READ_TIMEOUT_SEC = 0.5', source)
+        self.assertIn('def read_line_with_timeout(client, timeout_sec)', source)
+        self.assertIn('def read_bytes_with_timeout(client, length, timeout_sec)', source)
+        self.assertIn('client.read_nonblock', source)
+        self.assertIn('Client request body timed out', source)
+        self.assertNotIn('client.gets', source)
+        self.assertNotIn('client.read(length)', source)
+
+    def test_client_is_closed_on_error_paths(self):
+        source = RUBY_MAIN.read_text(encoding="utf-8")
+
+        self.assertIn('ensure', source)
+        self.assertIn('client.close unless client.closed?', source)
 
     def test_empty_probe_connections_are_ignored(self):
         source = RUBY_MAIN.read_text(encoding="utf-8")

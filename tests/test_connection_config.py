@@ -9,6 +9,8 @@ class ConnectionConfigTests(unittest.TestCase):
     def tearDown(self):
         server.clear_sketchup_port_override()
         server.startup.clear_session_autostart_allowed()
+        server._active_request_count = 0
+        server._last_activity_monotonic = 0.0
         if server._sketchup_connection is not None:
             try:
                 server._sketchup_connection.disconnect()
@@ -28,6 +30,31 @@ class ConnectionConfigTests(unittest.TestCase):
         with patch.dict("os.environ", {"SKETCHUP_MCP_PORT": "70000"}):
             with self.assertRaisesRegex(ValueError, "SKETCHUP_MCP_PORT"):
                 server.get_sketchup_port()
+
+    def test_idle_timeout_defaults_to_positive_value(self):
+        self.assertEqual(server.get_idle_timeout_sec(), server.DEFAULT_IDLE_TIMEOUT_SEC)
+
+    def test_idle_timeout_can_be_configured_or_disabled(self):
+        with patch.dict("os.environ", {"SKETCHUP_MCP_IDLE_TIMEOUT_SEC": "120"}):
+            self.assertEqual(server.get_idle_timeout_sec(), 120.0)
+
+        with patch.dict("os.environ", {"SKETCHUP_MCP_IDLE_TIMEOUT_SEC": "0"}):
+            self.assertEqual(server.get_idle_timeout_sec(), 0.0)
+
+    def test_idle_timeout_rejects_invalid_values(self):
+        with patch.dict("os.environ", {"SKETCHUP_MCP_IDLE_TIMEOUT_SEC": "-1"}):
+            with self.assertRaisesRegex(ValueError, "SKETCHUP_MCP_IDLE_TIMEOUT_SEC"):
+                server.get_idle_timeout_sec()
+
+    def test_idle_timeout_waits_for_inactive_server(self):
+        server._last_activity_monotonic = 100.0
+        server._active_request_count = 0
+
+        self.assertFalse(server._server_is_idle_too_long(now=150.0, timeout_sec=60.0))
+        self.assertTrue(server._server_is_idle_too_long(now=161.0, timeout_sec=60.0))
+
+        server._active_request_count = 1
+        self.assertFalse(server._server_is_idle_too_long(now=1_000.0, timeout_sec=60.0))
 
     def test_connection_target_can_be_changed_for_current_mcp_process(self):
         with patch.dict("os.environ", {"SKETCHUP_MCP_PORT": "9876"}):

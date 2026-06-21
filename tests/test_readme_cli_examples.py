@@ -45,6 +45,7 @@ class ReadmeCliExamplesTests(unittest.TestCase):
         self.assertIn("SKETCHUP_MCP_AUTOSTART", readme)
         self.assertIn("SKETCHUP_MCP_SKETCHUP_EXE", readme)
         self.assertIn("SKETCHUP_MCP_REQUEST_TIMEOUT_MS", readme)
+        self.assertIn("SKETCHUP_MCP_IDLE_TIMEOUT_SEC", readme)
         self.assertIn("ask the user whether", readme)
         self.assertIn("allow_sketchup_autostart", readme)
         self.assertIn("set_connection_port", readme)

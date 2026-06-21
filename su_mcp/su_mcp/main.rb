@@ -9,6 +9,7 @@ SKETCHUP_CONSOLE.show rescue nil
 module SU_MCP
   class Server
     DEFAULT_PORT = 9876
+    CLIENT_READ_TIMEOUT_SEC = 0.5
     SETTINGS_NAMESPACE = "SU_MCP"
     SETTINGS_PORT_KEY = "port"
 
@@ -127,60 +128,62 @@ module SU_MCP
                 client = @server.accept_nonblock
                 log "Client accepted"
                 
-                data = read_client_payload(client)
-                
-                if data
-                  log "Raw data: #{data.inspect}"
-                  begin
-                    # Parse the raw JSON first to check format
-                    raw_request = JSON.parse(data)
-                    log "Raw parsed request: #{raw_request.inspect}"
-                    
-                    # Extract the original request ID if it exists in the raw data
-                    original_id = nil
-                    if data =~ /"id":\s*(\d+)/
-                      original_id = $1.to_i
-                      log "Found original request ID: #{original_id}"
-                    end
-                    
-                    # Use the raw request directly without transforming it
-                    # Just ensure the ID is preserved if it exists
-                    request = raw_request
-                    if !request["id"] && original_id
-                      request["id"] = original_id
-                      log "Added missing ID: #{original_id}"
-                    end
+                begin
+                  data = read_client_payload(client)
 
-                    if request_expired?(request)
-                      log "Dropped expired request: #{request.inspect}"
-                    else
-                      log "Processed request: #{request.inspect}"
-                      response = handle_jsonrpc_request(request)
-                      log "Sending response: #{response.inspect}"
-                      write_json_response(client, response)
-                      log "Response sent"
+                  if data
+                    log "Raw data: #{data.inspect}"
+                    begin
+                      # Parse the raw JSON first to check format
+                      raw_request = JSON.parse(data)
+                      log "Raw parsed request: #{raw_request.inspect}"
+
+                      # Extract the original request ID if it exists in the raw data
+                      original_id = nil
+                      if data =~ /"id":\s*(\d+)/
+                        original_id = $1.to_i
+                        log "Found original request ID: #{original_id}"
+                      end
+
+                      # Use the raw request directly without transforming it
+                      # Just ensure the ID is preserved if it exists
+                      request = raw_request
+                      if !request["id"] && original_id
+                        request["id"] = original_id
+                        log "Added missing ID: #{original_id}"
+                      end
+
+                      if request_expired?(request)
+                        log "Dropped expired request: #{request.inspect}"
+                      else
+                        log "Processed request: #{request.inspect}"
+                        response = handle_jsonrpc_request(request)
+                        log "Sending response: #{response.inspect}"
+                        write_json_response(client, response)
+                        log "Response sent"
+                      end
+                    rescue JSON::ParserError => e
+                      log "JSON parse error: #{e.message}"
+                      error_response = {
+                        jsonrpc: "2.0",
+                        error: { code: -32700, message: "Parse error" },
+                        id: original_id
+                      }
+                      write_json_response(client, error_response)
+                    rescue StandardError => e
+                      log "Request error: #{e.message}"
+                      error_response = {
+                        jsonrpc: "2.0",
+                        error: { code: -32603, message: e.message },
+                        id: request ? request["id"] : original_id
+                      }
+                      write_json_response(client, error_response)
                     end
-                  rescue JSON::ParserError => e
-                    log "JSON parse error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32700, message: "Parse error" },
-                      id: original_id
-                    }
-                    write_json_response(client, error_response)
-                  rescue StandardError => e
-                    log "Request error: #{e.message}"
-                    error_response = {
-                      jsonrpc: "2.0",
-                      error: { code: -32603, message: e.message },
-                      id: request ? request["id"] : original_id
-                    }
-                    write_json_response(client, error_response)
                   end
+                ensure
+                  client.close unless client.closed?
+                  log "Client closed"
                 end
-                
-                client.close
-                log "Client closed"
               end
             end
           rescue IO::WaitReadable
@@ -235,9 +238,9 @@ module SU_MCP
     end
 
     def read_client_payload(client)
-      first_line = client.gets
+      first_line = read_line_with_timeout(client, CLIENT_READ_TIMEOUT_SEC)
       unless first_line
-        log "Client closed before sending a request"
+        log "Client closed or timed out before sending a request"
         return nil
       end
 
@@ -245,15 +248,71 @@ module SU_MCP
       return first_line unless match
 
       length = match[1].to_i
-      while (line = client.gets)
+      while (line = read_line_with_timeout(client, CLIENT_READ_TIMEOUT_SEC))
         break if line == "\r\n" || line == "\n"
       end
 
       return nil if length <= 0
 
-      client.read(length)
+      body = read_bytes_with_timeout(client, length, CLIENT_READ_TIMEOUT_SEC)
+      return nil unless body
+
+      body.force_encoding("UTF-8") if body.respond_to?(:force_encoding)
+      body
     rescue EOFError, Errno::ECONNRESET => e
       log "Client closed before sending a request: #{e.message}"
+      nil
+    end
+
+    def read_line_with_timeout(client, timeout_sec)
+      deadline = Time.now + timeout_sec
+      line = +""
+
+      loop do
+        remaining = deadline - Time.now
+        return nil if remaining <= 0
+        return nil unless IO.select([client], nil, nil, remaining)
+
+        begin
+          char = client.read_nonblock(1)
+          line << char
+          return line if char == "\n"
+        rescue IO::WaitReadable
+          next
+        rescue EOFError
+          return line.empty? ? nil : line
+        end
+      end
+    rescue Errno::ECONNRESET => e
+      log "Client closed while reading a request line: #{e.message}"
+      nil
+    end
+
+    def read_bytes_with_timeout(client, length, timeout_sec)
+      deadline = Time.now + timeout_sec
+      data = +""
+
+      while data.bytesize < length
+        remaining = deadline - Time.now
+        if remaining <= 0
+          log "Client request body timed out after #{data.bytesize}/#{length} bytes"
+          return nil
+        end
+        return nil unless IO.select([client], nil, nil, remaining)
+
+        begin
+          data << client.read_nonblock(length - data.bytesize)
+        rescue IO::WaitReadable
+          next
+        rescue EOFError
+          log "Client closed before request body was complete"
+          return nil
+        end
+      end
+
+      data
+    rescue Errno::ECONNRESET => e
+      log "Client closed while reading request body: #{e.message}"
       nil
     end
 

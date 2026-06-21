@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -25,9 +26,15 @@ DEFAULT_SKETCHUP_PORT = 9876
 SKETCHUP_PORT_ENV = "SKETCHUP_MCP_PORT"
 DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 REQUEST_TIMEOUT_ENV = "SKETCHUP_MCP_REQUEST_TIMEOUT_MS"
+DEFAULT_IDLE_TIMEOUT_SEC = 3600.0
+IDLE_TIMEOUT_ENV = "SKETCHUP_MCP_IDLE_TIMEOUT_SEC"
 CONTENT_LENGTH_PREFIX = b"Content-Length:"
 
 _sketchup_port_override = None
+_last_activity_monotonic = time.monotonic()
+_active_request_count = 0
+_activity_lock = threading.Lock()
+_idle_watchdog_started = False
 
 def _frame_json_payload(payload: bytes) -> bytes:
     return f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii") + payload
@@ -59,6 +66,54 @@ def _extract_framed_body(data: bytes) -> bytes | None:
         return None
 
     return data[body_start:body_end]
+
+def mark_activity_started() -> None:
+    global _active_request_count, _last_activity_monotonic
+    with _activity_lock:
+        _active_request_count += 1
+        _last_activity_monotonic = time.monotonic()
+
+def mark_activity_finished() -> None:
+    global _active_request_count, _last_activity_monotonic
+    with _activity_lock:
+        _active_request_count = max(0, _active_request_count - 1)
+        _last_activity_monotonic = time.monotonic()
+
+def _server_is_idle_too_long(now: float, timeout_sec: float) -> bool:
+    if timeout_sec <= 0:
+        return False
+
+    with _activity_lock:
+        if _active_request_count > 0:
+            return False
+        return now - _last_activity_monotonic > timeout_sec
+
+def start_idle_watchdog() -> None:
+    global _idle_watchdog_started
+    if _idle_watchdog_started:
+        return
+
+    timeout_sec = get_idle_timeout_sec()
+    if timeout_sec <= 0:
+        logger.info("MCP idle watchdog disabled")
+        return
+
+    _idle_watchdog_started = True
+
+    def watch_idle_timeout() -> None:
+        interval = min(60.0, max(1.0, timeout_sec / 4.0))
+        while True:
+            time.sleep(interval)
+            if _server_is_idle_too_long(time.monotonic(), timeout_sec):
+                logger.info("MCP server idle for %.1f seconds; exiting", timeout_sec)
+                try:
+                    if _sketchup_connection is not None:
+                        _sketchup_connection.disconnect()
+                finally:
+                    os._exit(0)
+
+    thread = threading.Thread(target=watch_idle_timeout, name="sketchup-mcp-idle-watchdog", daemon=True)
+    thread.start()
 
 @dataclass
 class SketchupConnection:
@@ -180,6 +235,14 @@ class SketchupConnection:
             raise Exception("No data received")
 
     def send_command(self, method: str, params: Dict[str, Any] = None, request_id: Any = None) -> Dict[str, Any]:
+        """Send a JSON-RPC request to Sketchup and return the response"""
+        mark_activity_started()
+        try:
+            return self._send_command(method, params, request_id)
+        finally:
+            mark_activity_finished()
+
+    def _send_command(self, method: str, params: Dict[str, Any] = None, request_id: Any = None) -> Dict[str, Any]:
         """Send a JSON-RPC request to Sketchup and return the response"""
         # Try to connect if not connected
         if not self.connect():
@@ -304,6 +367,20 @@ def get_request_timeout_ms() -> int:
     if timeout_ms <= 0:
         raise ValueError(f"{REQUEST_TIMEOUT_ENV} must be a positive integer")
     return timeout_ms
+
+def get_idle_timeout_sec() -> float:
+    raw_timeout = os.environ.get(IDLE_TIMEOUT_ENV)
+    if raw_timeout is None or raw_timeout.strip() == "":
+        return DEFAULT_IDLE_TIMEOUT_SEC
+
+    try:
+        timeout_sec = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{IDLE_TIMEOUT_ENV} must be a non-negative number") from exc
+
+    if timeout_sec < 0:
+        raise ValueError(f"{IDLE_TIMEOUT_ENV} must be a non-negative number")
+    return timeout_sec
 
 def _parse_sketchup_port(value: Any, source: str) -> int:
     try:
@@ -811,6 +888,7 @@ def eval_ruby(
         })
 
 def main():
+    start_idle_watchdog()
     mcp.run()
 
 if __name__ == "__main__":

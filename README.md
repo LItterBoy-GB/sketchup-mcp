@@ -96,6 +96,7 @@ SKETCHUP_MCP_AUTOSTART = "1"
 SKETCHUP_MCP_SKETCHUP_EXE = "C:\\Program Files\\SketchUp\\SketchUp 2026\\SketchUp.exe"
 SKETCHUP_MCP_STARTUP_TIMEOUT = "45"
 SKETCHUP_MCP_REQUEST_TIMEOUT_MS = "15000"
+SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "3600"
 ```
 
 Autostart runs only after the user has approved it, either through
@@ -108,6 +109,10 @@ Every Python-to-Sketchup request includes a send timestamp and
 `SKETCHUP_MCP_REQUEST_TIMEOUT_MS`. If Sketchup is busy and only handles the
 socket after that timeout has elapsed, the Ruby extension drops the stale
 request without executing it.
+
+`SKETCHUP_MCP_IDLE_TIMEOUT_SEC` controls how long an unused stdio MCP process
+can stay alive after its last Sketchup command. Set it to `0` to disable the
+idle watchdog.
 
 For a second Sketchup instance, add another server name and a different port:
 
