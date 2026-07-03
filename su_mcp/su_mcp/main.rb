@@ -112,6 +112,7 @@ module SU_MCP
       
       begin
         log "Starting server on localhost:#{@port}..."
+        initialize_eval_ruby_log
         
         @server = TCPServer.new('127.0.0.1', @port)
         log "Server created on port #{@port}"
@@ -235,6 +236,62 @@ module SU_MCP
       @port_command.menu_text = port_menu_text
     rescue StandardError => e
       log "Failed to update port menu text: #{e.message}"
+    end
+
+    def eval_ruby_log_dir
+      File.expand_path("../eval_ruby_logs", __dir__)
+    end
+
+    def initialize_eval_ruby_log
+      FileUtils.mkdir_p(eval_ruby_log_dir)
+      timestamp = Time.now.strftime("%Y%m%d_%H%M%S_%L")
+      @eval_ruby_log_path = File.join(eval_ruby_log_dir, "eval_ruby_#{timestamp}_#{$$}.rb")
+
+      File.open(@eval_ruby_log_path, "w:UTF-8") do |file|
+        file.puts "# SU_MCP eval_ruby session log"
+        file.puts "# started_at: #{Time.now.strftime("%Y-%m-%d %H:%M:%S %z")}"
+        file.puts "# pid: #{$$}"
+        file.puts
+      end
+
+      log "eval_ruby session log: #{@eval_ruby_log_path}"
+    rescue StandardError => e
+      @eval_ruby_log_path = nil
+      log "Failed to initialize eval_ruby session log: #{e.message}"
+    end
+
+    def append_eval_ruby_log_entry(code:, started_at:, finished_at:, status:, result: nil, error: nil)
+      return unless @eval_ruby_log_path
+
+      duration_ms = ((finished_at - started_at) * 1000.0).round(2)
+      File.open(@eval_ruby_log_path, "a:UTF-8") do |file|
+        file.puts "# --- eval_ruby start ---"
+        file.puts "# time: #{started_at.strftime("%Y-%m-%d %H:%M:%S %z")}"
+        file.puts "# status: #{status}"
+        file.puts "# duration_ms: #{duration_ms}"
+        file.puts "# request_length: #{code.length}"
+        file.puts "# result_class: #{result.class}" if status == "success"
+        if error
+          file.puts "# error_class: #{error.class}"
+          file.puts format_eval_ruby_log_comment("error", error.message)
+          file.puts "# backtrace:"
+          Array(error.backtrace).each { |line| file.puts "#   #{line}" }
+        end
+        file.puts code
+        file.puts "# --- eval_ruby end ---"
+        file.puts
+      end
+    rescue StandardError => e
+      log "Failed to append eval_ruby session log: #{e.message}"
+    end
+
+    def format_eval_ruby_log_comment(label, value)
+      lines = value.to_s.lines.map(&:chomp)
+      lines = [""] if lines.empty?
+      lines.each_with_index.map do |line, index|
+        prefix = index.zero? ? "# #{label}: " : "# #{' ' * label.length}  "
+        "#{prefix}#{line}"
+      end.join("\n")
     end
 
     def read_client_payload(client)
@@ -2125,26 +2182,42 @@ module SU_MCP
     end
     
     def eval_ruby(params)
-      log "Evaluating Ruby code with length: #{params['code'].length}"
-      
+      code = params["code"]
+      started_at = Time.now
+      result = nil
+      error = nil
+      status = "success"
+      log "Evaluating Ruby code with length: #{code.length}"
+
       begin
         # Create a safe binding for evaluation
         binding = TOPLEVEL_BINDING.dup
-        
+
         # Evaluate the Ruby code
         log "Starting code evaluation..."
-        result = eval(params["code"], binding)
+        result = eval(code, binding)
         log "Code evaluation completed with result: #{result.inspect}"
-        
+
         # Return success with the result as a string
-        { 
+        {
           success: true,
           result: result.to_s
         }
       rescue StandardError => e
+        error = e
+        status = "error"
         log "Error in eval_ruby: #{e.message}"
         log e.backtrace.join("\n")
         raise "Ruby evaluation error: #{e.message}"
+      ensure
+        append_eval_ruby_log_entry(
+          code: code,
+          started_at: started_at,
+          finished_at: Time.now,
+          status: status,
+          result: result,
+          error: error
+        )
       end
     end
   end
