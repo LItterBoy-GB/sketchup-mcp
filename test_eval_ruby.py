@@ -17,10 +17,15 @@ puts "Created line with ID: #{line.entityID}"
 line.entityID
 '''
 
-# Call the function
-result = eval_ruby(MockContext(), test_code)
-print(f"Result: {result}")
+def main():
+    # Call the function
+    result = eval_ruby(MockContext(), test_code)
+    print(f"Result: {result}")
 
-# Parse the result
-parsed = json.loads(result)
-print(f"Parsed: {json.dumps(parsed, indent=2)}") 
+    # Parse the result
+    parsed = json.loads(result)
+    print(f"Parsed: {json.dumps(parsed, indent=2)}")
+
+
+if __name__ == "__main__":
+    main()

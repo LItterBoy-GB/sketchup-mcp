@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
 
-from . import startup
+from . import modal_guard, startup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -66,6 +66,17 @@ def _extract_framed_body(data: bytes) -> bytes | None:
         return None
 
     return data[body_start:body_end]
+
+def _request_prevents_modal_hang(request: Dict[str, Any]) -> bool:
+    if request.get("method") != "tools/call":
+        return False
+
+    params = request.get("params")
+    if not isinstance(params, dict) or params.get("name") != "eval_ruby":
+        return False
+
+    arguments = params.get("arguments")
+    return isinstance(arguments, dict) and arguments.get("prevent_modal_hang") is True
 
 def mark_activity_started() -> None:
     global _active_request_count, _last_activity_monotonic
@@ -207,6 +218,8 @@ class SketchupConnection:
                         continue
                 except socket.timeout:
                     logger.warning("Socket timeout during chunked receive")
+                    if not chunks:
+                        raise
                     break
                 except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
                     logger.error(f"Socket connection error during receive: {str(e)}")
@@ -314,6 +327,12 @@ class SketchupConnection:
                 
             except (socket.timeout, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
                 logger.warning(f"Connection error (attempt {retry_count+1}/{max_retries+1}): {str(e)}")
+                if isinstance(e, socket.timeout) and _request_prevents_modal_hang(request):
+                    modal = modal_guard.interrupt_modal_for_port(self.host, self.port, request_id=request_id)
+                    if modal:
+                        self.disconnect()
+                        raise modal_guard.ModalGuardInterrupted(modal)
+
                 retry_count += 1
                 
                 if retry_count <= max_retries:
@@ -852,21 +871,23 @@ def create_finger_joint(
 @mcp.tool()
 def eval_ruby(
     ctx: Context,
-    code: str
+    code: str,
+    prevent_modal_hang: bool = False
 ) -> str:
     """Evaluate arbitrary Ruby code in Sketchup"""
     try:
         logger.info(f"eval_ruby called with code length: {len(code)}")
         
         sketchup = get_sketchup_connection()
+        arguments = {"code": code}
+        if prevent_modal_hang:
+            arguments["prevent_modal_hang"] = True
         
         result = sketchup.send_command(
             method="tools/call",
             params={
                 "name": "eval_ruby",
-                "arguments": {
-                    "code": code
-                }
+                "arguments": arguments
             },
             request_id=ctx.request_id
         )
@@ -878,11 +899,16 @@ def eval_ruby(
             "success": True,
             "result": result.get("content", [{"text": "Success"}])[0].get("text", "Success") if isinstance(result.get("content"), list) and len(result.get("content", [])) > 0 else "Success"
         }
+        if "ui_events" in result:
+            response["ui_events"] = result["ui_events"]
         
         return json.dumps(response)
+    except modal_guard.ModalGuardInterrupted as e:
+        logger.error(f"Modal guard interrupted eval_ruby: {str(e)}")
+        return json.dumps(e.to_payload())
     except Exception as e:
         logger.error(f"Error in eval_ruby: {str(e)}")
-        return json.dumps({
+        return json.dumps(modal_guard.payload_from_exception(e) or {
             "success": False,
             "error": str(e)
         })

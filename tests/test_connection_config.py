@@ -1,5 +1,6 @@
 import unittest
 import json
+import socket
 from unittest.mock import patch
 
 from sketchup_mcp import server
@@ -203,6 +204,97 @@ class ConnectionConfigTests(unittest.TestCase):
         connection = server.SketchupConnection(host="localhost", port=9876)
 
         self.assertEqual(connection.receive_full_response(FakeSocket(), buffer_size=8), payload)
+
+    def test_eval_ruby_tool_passes_prevent_modal_hang_to_sketchup(self):
+        sent = {}
+
+        class FakeConnection:
+            def send_command(self, method, params=None, request_id=None):
+                sent["method"] = method
+                sent["params"] = params
+                sent["request_id"] = request_id
+                return {
+                    "content": [{"text": "2"}],
+                    "ui_events": [{"api": "UI.messagebox", "result": "IDNO"}],
+                }
+
+        class FakeContext:
+            request_id = 123
+
+        with patch.object(server, "get_sketchup_connection", return_value=FakeConnection()):
+            response = json.loads(server.eval_ruby(FakeContext(), "1 + 1", prevent_modal_hang=True))
+
+        self.assertEqual(sent["method"], "tools/call")
+        self.assertEqual(sent["params"]["name"], "eval_ruby")
+        self.assertEqual(sent["params"]["arguments"], {"code": "1 + 1", "prevent_modal_hang": True})
+        self.assertEqual(sent["request_id"], 123)
+        self.assertEqual(response["result"], "2")
+        self.assertEqual(response["ui_events"], [{"api": "UI.messagebox", "result": "IDNO"}])
+
+    def test_modal_guard_runs_on_eval_timeout_when_prevent_modal_hang_enabled(self):
+        class FakeSocket:
+            def settimeout(self, timeout):
+                pass
+
+            def sendall(self, payload):
+                pass
+
+            def close(self):
+                pass
+
+        connection = server.SketchupConnection(host="localhost", port=9876, sock=FakeSocket())
+        modal = {
+            "pid": 42,
+            "hwnd": "0x0000002a",
+            "title": "Confirm",
+            "class": "#32770",
+            "main_disabled": True,
+            "action": "wm_close",
+            "request_id": 9,
+        }
+
+        with (
+            patch.object(connection, "connect", return_value=True),
+            patch.object(connection, "receive_full_response", side_effect=socket.timeout("timed out")),
+            patch("sketchup_mcp.server.modal_guard.interrupt_modal_for_port", return_value=modal) as guard,
+        ):
+            with self.assertRaises(server.modal_guard.ModalGuardInterrupted) as raised:
+                connection.send_command(
+                    "eval_ruby",
+                    {"code": "UI.messagebox('x')", "prevent_modal_hang": True},
+                    request_id=9,
+                )
+
+        guard.assert_called_once_with("localhost", 9876, request_id=9)
+        self.assertEqual(raised.exception.to_payload()["status"], "interrupted_by_modal")
+        self.assertEqual(raised.exception.to_payload()["modal"], modal)
+
+    def test_modal_guard_does_not_run_on_timeout_without_switch(self):
+        class FakeSocket:
+            def settimeout(self, timeout):
+                pass
+
+            def sendall(self, payload):
+                pass
+
+            def close(self):
+                pass
+
+        connection = server.SketchupConnection(host="localhost", port=9876, sock=FakeSocket())
+
+        def reconnect():
+            connection.sock = FakeSocket()
+            return True
+
+        with (
+            patch.object(connection, "connect", side_effect=reconnect),
+            patch.object(connection, "receive_full_response", side_effect=socket.timeout("timed out")),
+            patch("sketchup_mcp.server.modal_guard.interrupt_modal_for_port") as guard,
+        ):
+            with self.assertRaisesRegex(Exception, "Connection to Sketchup lost"):
+                connection.send_command("eval_ruby", {"code": "1 + 1"}, request_id=9)
+
+        guard.assert_not_called()
 
 
 if __name__ == "__main__":

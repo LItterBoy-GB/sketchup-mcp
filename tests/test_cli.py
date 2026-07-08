@@ -77,6 +77,32 @@ class CliEvalTests(unittest.TestCase):
         self.assertTrue(sent["disconnected"])
         self.assertEqual(json.loads(stdout.getvalue()), {"success": True, "content": [{"text": "2"}]})
 
+    def test_eval_can_enable_prevent_modal_hang(self):
+        sent = {}
+
+        class FakeConnection:
+            def __init__(self, host, port):
+                self.host = host
+                self.port = port
+
+            def send_command(self, method, params=None, request_id=None):
+                sent["method"] = method
+                sent["params"] = params
+                sent["request_id"] = request_id
+                return {"success": True, "content": [{"text": "2"}]}
+
+            def disconnect(self):
+                pass
+
+        stdout = io.StringIO()
+        with patch.object(cli, "SketchupConnection", FakeConnection):
+            exit_code = cli.main(["eval", "--prevent-modal-hang", "1 + 1"], stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sent["method"], "eval_ruby")
+        self.assertEqual(sent["params"], {"code": "1 + 1", "prevent_modal_hang": True})
+        self.assertEqual(sent["request_id"], 1)
+
     def test_ping_sends_protocol_request_instead_of_connect_probe(self):
         sent = {}
 

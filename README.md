@@ -219,6 +219,7 @@ extension directly without going through an MCP host:
 ```powershell
 sketchup-mcp-cli --port 9877 ping
 sketchup-mcp-cli --port 9877 eval "Sketchup.active_model.title"
+sketchup-mcp-cli --port 9877 eval --prevent-modal-hang "UI.messagebox('confirm?')"
 sketchup-mcp-cli --port 9877 eval --file .\probe.rb
 sketchup-mcp-cli --port 9877 call get_selection
 sketchup-mcp-cli --port 9877 --start-sketchup-if-needed --sketchup-exe "C:\Program Files\SketchUp\SketchUp 2026\SketchUp.exe" ping
@@ -226,6 +227,12 @@ sketchup-mcp-cli --port 9877 --start-sketchup-if-needed --sketchup-exe "C:\Progr
 
 Use `eval --file` for larger Ruby snippets or when shell quoting would make an
 inline string fragile.
+
+Use `eval --prevent-modal-hang` only for non-interactive automation runs that
+must not block on Sketchup UI. It sends `prevent_modal_hang: true` for that
+single `eval_ruby` call, returns `nil` from file/input dialogs, chooses safe
+cancel/no answers for message boxes when available, and may interrupt a detected
+Sketchup-owned modal window after a request timeout.
 
 Once connected, Codex, opencode, or another MCP client can interact with Sketchup using the following capabilities:
 

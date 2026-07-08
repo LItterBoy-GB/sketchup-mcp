@@ -12,6 +12,7 @@ module SU_MCP
     CLIENT_READ_TIMEOUT_SEC = 0.5
     SETTINGS_NAMESPACE = "SU_MCP"
     SETTINGS_PORT_KEY = "port"
+    EVAL_RUBY_UI_GUARD_METHODS = [:messagebox, :openpanel, :savepanel, :inputbox].freeze
 
     attr_reader :port
 
@@ -260,7 +261,7 @@ module SU_MCP
       log "Failed to initialize eval_ruby session log: #{e.message}"
     end
 
-    def append_eval_ruby_log_entry(code:, started_at:, finished_at:, status:, result: nil, error: nil)
+    def append_eval_ruby_log_entry(code:, started_at:, finished_at:, status:, result: nil, error: nil, ui_events: [])
       return unless @eval_ruby_log_path
 
       duration_ms = ((finished_at - started_at) * 1000.0).round(2)
@@ -271,6 +272,11 @@ module SU_MCP
         file.puts "# duration_ms: #{duration_ms}"
         file.puts "# request_length: #{code.length}"
         file.puts "# result_class: #{result.class}" if status == "success"
+        Array(ui_events).each do |event|
+          file.puts "# ui_event_api: #{event[:api]}"
+          file.puts "# ui_event_args: #{Array(event[:args]).join(', ')}"
+          file.puts "# ui_event_result: #{event[:result]}"
+        end
         if error
           file.puts "# error_class: #{error.class}"
           file.puts format_eval_ruby_log_comment("error", error.message)
@@ -292,6 +298,119 @@ module SU_MCP
         prefix = index.zero? ? "# #{label}: " : "# #{' ' * label.length}  "
         "#{prefix}#{line}"
       end.join("\n")
+    end
+
+    def eval_ruby_ui_guard_enabled?(params)
+      value = params["prevent_modal_hang"] || params[:prevent_modal_hang]
+      value == true || value.to_s.downcase == "true"
+    end
+
+    def with_eval_ruby_ui_guard(ui_events)
+      ui_singleton = class << UI; self; end
+      originals = {}
+
+      EVAL_RUBY_UI_GUARD_METHODS.each do |method_name|
+        if UI.respond_to?(method_name)
+          originals[method_name] = { defined: true, method: UI.method(method_name) }
+        else
+          originals[method_name] = { defined: false }
+        end
+      end
+
+      server = self
+      ui_singleton.define_method(:messagebox) do |*args|
+        result = server.send(:eval_ruby_messagebox_result, args)
+        server.send(:append_eval_ruby_ui_event, ui_events, "UI.messagebox", args, result)
+        result
+      end
+      ui_singleton.define_method(:openpanel) do |*args|
+        result = nil
+        server.send(:append_eval_ruby_ui_event, ui_events, "UI.openpanel", args, result)
+        result
+      end
+      ui_singleton.define_method(:savepanel) do |*args|
+        result = nil
+        server.send(:append_eval_ruby_ui_event, ui_events, "UI.savepanel", args, result)
+        result
+      end
+      ui_singleton.define_method(:inputbox) do |*args|
+        result = nil
+        server.send(:append_eval_ruby_ui_event, ui_events, "UI.inputbox", args, result)
+        result
+      end
+
+      yield
+    ensure
+      if ui_singleton && originals
+        originals.each do |method_name, original|
+          if original[:defined]
+            original_method = original[:method]
+            ui_singleton.define_method(method_name) do |*args, &block|
+              original_method.call(*args, &block)
+            end
+          elsif UI.respond_to?(method_name)
+            ui_singleton.remove_method(method_name)
+          end
+        end
+      end
+    end
+
+    def eval_ruby_messagebox_result(args)
+      button_type = args[1]
+      mb_ok = eval_ruby_ui_constant(:MB_OK)
+      button_type = mb_ok if button_type.nil?
+      button_group = button_type.to_i & 0x0F
+
+      cancel_types = [
+        eval_ruby_ui_constant(:MB_OKCANCEL),
+        eval_ruby_ui_constant(:MB_RETRYCANCEL),
+        eval_ruby_ui_constant(:MB_YESNOCANCEL)
+      ].compact
+      return eval_ruby_ui_constant(:IDCANCEL) if cancel_types.include?(button_group)
+
+      yes_no_types = [eval_ruby_ui_constant(:MB_YESNO)].compact
+      return eval_ruby_ui_constant(:IDNO) if yes_no_types.include?(button_group)
+
+      abort_types = [eval_ruby_ui_constant(:MB_ABORTRETRYIGNORE)].compact
+      return eval_ruby_ui_constant(:IDABORT) if abort_types.include?(button_group)
+
+      return eval_ruby_ui_constant(:IDOK) if !mb_ok || button_group == mb_ok
+
+      eval_ruby_ui_constant(:IDCANCEL) || eval_ruby_ui_constant(:IDNO) || eval_ruby_ui_constant(:IDOK)
+    end
+
+    def eval_ruby_ui_constant(name)
+      UI.const_defined?(name) ? UI.const_get(name) : nil
+    end
+
+    def append_eval_ruby_ui_event(ui_events, api, args, result)
+      ui_events << {
+        api: api,
+        args: args.map { |arg| summarize_eval_ruby_ui_arg(arg) },
+        result: eval_ruby_ui_result_label(result)
+      }
+    end
+
+    def summarize_eval_ruby_ui_arg(arg)
+      summary = arg.inspect
+      summary.length > 200 ? "#{summary[0, 197]}..." : summary
+    rescue StandardError
+      arg.class.to_s
+    end
+
+    def eval_ruby_ui_result_label(result)
+      return "nil" if result.nil?
+
+      {
+        eval_ruby_ui_constant(:IDOK) => "IDOK",
+        eval_ruby_ui_constant(:IDCANCEL) => "IDCANCEL",
+        eval_ruby_ui_constant(:IDNO) => "IDNO",
+        eval_ruby_ui_constant(:IDABORT) => "IDABORT"
+      }.each do |value, label|
+        return label if !value.nil? && result == value
+      end
+
+      result.inspect
     end
 
     def read_client_payload(client)
@@ -500,14 +619,16 @@ module SU_MCP
 
         log "Tool call result: #{result.inspect}"
         if result[:success]
+          response_result = {
+            content: [{ type: "text", text: result[:result] || "Success" }],
+            isError: false,
+            success: true,
+            resourceId: result[:id]
+          }
+          response_result[:ui_events] = result[:ui_events] if result[:ui_events]
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
-            result: {
-              content: [{ type: "text", text: result[:result] || "Success" }],
-              isError: false,
-              success: true,
-              resourceId: result[:id]
-            },
+            result: response_result,
             id: request["id"]
           }
           log "Sending success response: #{response.inspect}"
@@ -2187,6 +2308,7 @@ module SU_MCP
       result = nil
       error = nil
       status = "success"
+      ui_events = []
       log "Evaluating Ruby code with length: #{code.length}"
 
       begin
@@ -2195,14 +2317,20 @@ module SU_MCP
 
         # Evaluate the Ruby code
         log "Starting code evaluation..."
-        result = eval(code, binding)
+        if eval_ruby_ui_guard_enabled?(params)
+          result = with_eval_ruby_ui_guard(ui_events) { eval(code, binding) }
+        else
+          result = eval(code, binding)
+        end
         log "Code evaluation completed with result: #{result.inspect}"
 
         # Return success with the result as a string
-        {
+        response = {
           success: true,
           result: result.to_s
         }
+        response[:ui_events] = ui_events unless ui_events.empty?
+        response
       rescue StandardError => e
         error = e
         status = "error"
@@ -2216,7 +2344,8 @@ module SU_MCP
           finished_at: Time.now,
           status: status,
           result: result,
-          error: error
+          error: error,
+          ui_events: ui_events
         )
       end
     end

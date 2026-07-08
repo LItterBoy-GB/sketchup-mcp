@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Sequence, TextIO
 
-from . import startup
+from . import modal_guard, startup
 
 DEFAULT_SKETCHUP_HOST = "localhost"
 DEFAULT_SKETCHUP_PORT = 9876
@@ -81,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser = subparsers.add_parser("eval", help="Evaluate Ruby code in Sketchup")
     eval_parser.add_argument("code", nargs="?", help="Ruby code to evaluate")
     eval_parser.add_argument("-f", "--file", dest="code_file", help="Path to a Ruby file to evaluate")
+    eval_parser.add_argument(
+        "--prevent-modal-hang",
+        action="store_true",
+        help="For this eval call, cancel known Sketchup UI dialogs instead of letting eval_ruby hang",
+    )
 
     call_parser = subparsers.add_parser("call", help="Call a Sketchup Ruby extension tool")
     call_parser.add_argument("tool", help="Tool name, for example get_selection")
@@ -174,9 +179,12 @@ def main(
             return 0
 
         if args.command == "eval":
+            eval_arguments = {"code": load_eval_code(args)}
+            if args.prevent_modal_hang:
+                eval_arguments["prevent_modal_hang"] = True
             result = connection.send_command(
                 "eval_ruby",
-                {"code": load_eval_code(args)},
+                eval_arguments,
                 request_id=1,
             )
             _write_json(stdout, result)
@@ -193,7 +201,7 @@ def main(
 
         raise ValueError(f"Unsupported command: {args.command}")
     except Exception as exc:
-        _write_json(stderr, {"success": False, "error": str(exc)})
+        _write_json(stderr, modal_guard.payload_from_exception(exc) or {"success": False, "error": str(exc)})
         return 1
     finally:
         if connection is not None:
