@@ -1,5 +1,7 @@
 # SketchupMCP - Sketchup Model Context Protocol Integration
 
+[简体中文](README.zh-CN.md)
+
 SketchupMCP connects Sketchup to MCP clients such as Codex and opencode, allowing agents to directly interact with and control Sketchup. This integration enables prompt-assisted 3D modeling, scene creation, and manipulation in Sketchup.
 
 Big Shoutout to [Blender MCP](https://github.com/ahujasid/blender-mcp) for the inspiration and structure.
