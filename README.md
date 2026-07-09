@@ -188,6 +188,15 @@ per Sketchup window:
 2. The server will start on the default port (9876)
 3. Start Codex, opencode, or another configured MCP client
 
+Use the Sketchup `Extensions > MCP Server` menu as the local server control
+panel. `Start Server` starts the Ruby-side TCP listener, `Stop Server` pauses
+it, `Current Port` shows the active listener port, and `Set Port...` changes
+the port before starting a server. For multiple MCP connections, assign each
+Sketchup instance a different port here, then use the matching
+`SKETCHUP_MCP_PORT` in the MCP client configuration.
+
+![MCP Server menu showing current port, set port, start, and stop controls](docs/images/mcp-server-menu.png)
+
 ### Using Multiple Sketchup Instances
 
 Each Sketchup instance runs its own local TCP server. To connect multiple
