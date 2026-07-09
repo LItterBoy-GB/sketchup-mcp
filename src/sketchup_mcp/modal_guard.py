@@ -75,7 +75,7 @@ def close_modal_for_port(
     host: str,
     port: int,
     request_id: Any = None,
-    max_attempts: int = 8,
+    max_attempts: int = 32,
 ) -> Dict[str, Any]:
     max_attempts = max(1, int(max_attempts))
     closed_modals: List[Dict[str, Any]] = []

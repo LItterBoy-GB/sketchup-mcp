@@ -100,6 +100,31 @@ class ModalGuardTests(unittest.TestCase):
         self.assertEqual(state["closed_count"], 2)
         self.assertEqual([modal["action"] for modal in state["closed_modals"]], ["wm_close", "escape"])
 
+    def test_close_modal_default_attempts_cover_deep_htmldialog_wrapper_chain(self):
+        modals = [
+            {
+                "pid": 42,
+                "hwnd": f"0x{index + 0x20:08x}",
+                "class": "#32770",
+                "title": "HtmlDialog Wrapper",
+                "main_disabled": True,
+                "request_id": 9,
+            }
+            for index in range(9)
+        ]
+
+        with (
+            patch("sketchup_mcp.modal_guard.sys.platform", "win32"),
+            patch("sketchup_mcp.modal_guard.find_pid_for_local_port", return_value=42),
+            patch("sketchup_mcp.modal_guard.detect_modal_for_pid", side_effect=[*modals, None]),
+            patch("sketchup_mcp.modal_guard.close_modal_window", return_value="wm_close"),
+        ):
+            state = modal_guard.close_modal_for_port("localhost", 9876, request_id=9)
+
+        self.assertEqual(state["status"], "modal_closed")
+        self.assertFalse(state["is_modal"])
+        self.assertEqual(state["closed_count"], 9)
+
     def test_modal_state_reports_no_modal_when_listener_pid_is_missing(self):
         with (
             patch("sketchup_mcp.modal_guard.sys.platform", "win32"),
