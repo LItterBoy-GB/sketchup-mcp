@@ -205,6 +205,19 @@ class ConnectionConfigTests(unittest.TestCase):
 
         self.assertEqual(connection.receive_full_response(FakeSocket(), buffer_size=8), payload)
 
+    def test_receive_full_response_preserves_timeout_without_data(self):
+        class FakeSocket:
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, buffer_size):
+                raise socket.timeout("timed out")
+
+        connection = server.SketchupConnection(host="localhost", port=9876)
+
+        with self.assertRaises(socket.timeout):
+            connection.receive_full_response(FakeSocket(), buffer_size=8)
+
     def test_eval_ruby_tool_passes_prevent_modal_hang_to_sketchup(self):
         sent = {}
 
@@ -230,6 +243,51 @@ class ConnectionConfigTests(unittest.TestCase):
         self.assertEqual(sent["request_id"], 123)
         self.assertEqual(response["result"], "2")
         self.assertEqual(response["ui_events"], [{"api": "UI.messagebox", "result": "IDNO"}])
+
+    def test_get_modal_state_uses_configured_connection_target_without_ruby_request(self):
+        class FakeContext:
+            request_id = 123
+
+        expected = {
+            "success": True,
+            "status": "modal_detected",
+            "is_modal": True,
+            "pid": 42,
+            "modal": {"title": "EW Example"},
+        }
+
+        with (
+            patch.object(server, "get_sketchup_connection") as connection,
+            patch.object(server.modal_guard, "modal_state_for_port", return_value=expected) as state_for_port,
+        ):
+            response = json.loads(server.get_modal_state(FakeContext()))
+
+        connection.assert_not_called()
+        state_for_port.assert_called_once_with("localhost", 9876, request_id=123)
+        self.assertEqual(response, expected)
+
+    def test_close_modal_uses_configured_connection_target_without_ruby_request(self):
+        class FakeContext:
+            request_id = 123
+
+        expected = {
+            "success": True,
+            "status": "modal_closed",
+            "is_modal": True,
+            "closed": True,
+            "pid": 42,
+            "modal": {"title": "EW Example", "action": "wm_close"},
+        }
+
+        with (
+            patch.object(server, "get_sketchup_connection") as connection,
+            patch.object(server.modal_guard, "close_modal_for_port", return_value=expected) as close_for_port,
+        ):
+            response = json.loads(server.close_modal(FakeContext()))
+
+        connection.assert_not_called()
+        close_for_port.assert_called_once_with("localhost", 9876, request_id=123)
+        self.assertEqual(response, expected)
 
     def test_modal_guard_runs_on_eval_timeout_when_prevent_modal_hang_enabled(self):
         class FakeSocket:

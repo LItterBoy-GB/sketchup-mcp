@@ -5,6 +5,8 @@ import time
 from ctypes import wintypes
 from typing import Any, Dict, List, Optional
 
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
 
 class ModalGuardInterrupted(Exception):
     def __init__(self, modal: Dict[str, Any], status: str = "interrupted_by_modal"):
@@ -29,21 +31,87 @@ def payload_from_exception(exc: BaseException) -> Optional[Dict[str, Any]]:
 
 
 def interrupt_modal_for_port(host: str, port: int, request_id: Any = None) -> Optional[Dict[str, Any]]:
-    if sys.platform != "win32" or host not in {"localhost", "127.0.0.1", "::1"}:
+    result = close_modal_for_port(host, port, request_id=request_id)
+    if not result.get("closed"):
         return None
+
+    return result.get("last_closed_modal") or result.get("modal")
+
+
+def modal_state_for_port(host: str, port: int, request_id: Any = None) -> Dict[str, Any]:
+    base: Dict[str, Any] = {
+        "success": True,
+        "host": host,
+        "port": port,
+        "pid": None,
+        "is_modal": False,
+        "modal": None,
+    }
+
+    if sys.platform != "win32":
+        return {**base, "status": "unsupported_platform"}
+
+    if host not in LOCAL_HOSTS:
+        return {**base, "status": "unsupported_host"}
 
     pid = find_pid_for_local_port(port)
     if pid is None:
-        return None
+        return {**base, "status": "listener_not_found"}
 
     modal = detect_modal_for_pid(pid, request_id=request_id)
     if modal is None:
-        return None
+        return {**base, "status": "no_modal", "pid": pid}
 
-    hwnd = int(modal["hwnd"], 16)
-    action = close_modal_window(hwnd)
-    modal["action"] = action
-    return modal
+    return {
+        **base,
+        "status": "modal_detected",
+        "pid": pid,
+        "is_modal": True,
+        "modal": modal,
+    }
+
+
+def close_modal_for_port(
+    host: str,
+    port: int,
+    request_id: Any = None,
+    max_attempts: int = 8,
+) -> Dict[str, Any]:
+    max_attempts = max(1, int(max_attempts))
+    closed_modals: List[Dict[str, Any]] = []
+    last_action = None
+
+    for _attempt in range(max_attempts):
+        state = modal_state_for_port(host, port, request_id=request_id)
+        if not state.get("is_modal") or not state.get("modal"):
+            status = "modal_closed" if closed_modals else state["status"]
+            return {
+                **state,
+                "status": status,
+                "closed": bool(closed_modals),
+                "closed_count": len(closed_modals),
+                "closed_modals": closed_modals,
+                "last_closed_modal": closed_modals[-1] if closed_modals else None,
+                "action": last_action,
+            }
+
+        modal = dict(state["modal"])
+        hwnd = int(modal["hwnd"], 16)
+        last_action = close_modal_window(hwnd)
+        modal["action"] = last_action
+        closed_modals.append(modal)
+        time.sleep(0.1)
+
+    state = modal_state_for_port(host, port, request_id=request_id)
+    return {
+        **state,
+        "status": "modal_still_present" if state.get("is_modal") else "modal_closed",
+        "closed": bool(closed_modals),
+        "closed_count": len(closed_modals),
+        "closed_modals": closed_modals,
+        "last_closed_modal": closed_modals[-1] if closed_modals else None,
+        "action": last_action,
+    }
 
 
 def find_pid_for_local_port(port: int) -> Optional[int]:
@@ -111,6 +179,8 @@ def detect_modal_for_pid(pid: int, request_id: Any = None) -> Optional[Dict[str,
         if window.get("last_active_popup") and window.get("last_active_popup") != window["hwnd_int"]
     }
     main_disabled = any(not window["enabled"] for window in main_windows)
+    if not main_disabled:
+        return None
 
     popups = [
         window
@@ -127,7 +197,19 @@ def detect_modal_for_pid(pid: int, request_id: Any = None) -> Optional[Dict[str,
     if not main_disabled and not popups:
         return None
 
-    candidate = popups[0] if popups else main_windows[0]
+    enabled_popups = [window for window in popups if window["enabled"]]
+    last_active_popup_windows = [
+        window for window in popups if window["hwnd_int"] in last_active_popups
+    ]
+    candidate = (
+        enabled_popups[0]
+        if enabled_popups
+        else last_active_popup_windows[0]
+        if last_active_popup_windows
+        else popups[0]
+        if popups
+        else main_windows[0]
+    )
     return {
         "pid": pid,
         "hwnd": candidate["hwnd"],

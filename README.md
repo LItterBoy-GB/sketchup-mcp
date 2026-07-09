@@ -221,6 +221,8 @@ sketchup-mcp-cli --port 9877 ping
 sketchup-mcp-cli --port 9877 eval "Sketchup.active_model.title"
 sketchup-mcp-cli --port 9877 eval --prevent-modal-hang "UI.messagebox('confirm?')"
 sketchup-mcp-cli --port 9877 eval --file .\probe.rb
+sketchup-mcp-cli --port 9877 modal-state
+sketchup-mcp-cli --port 9877 close-modal
 sketchup-mcp-cli --port 9877 call get_selection
 sketchup-mcp-cli --port 9877 --start-sketchup-if-needed --sketchup-exe "C:\Program Files\SketchUp\SketchUp 2026\SketchUp.exe" ping
 ```
@@ -234,6 +236,12 @@ single `eval_ruby` call, returns `nil` from file/input dialogs, chooses safe
 cancel/no answers for message boxes when available, and may interrupt a detected
 Sketchup-owned modal window after a request timeout.
 
+Use `modal-state` after an eval timeout to inspect whether the configured local
+SketchUp process currently has a modal window. Use `close-modal` to close
+detected modal windows, repeating through a short bounded attempt loop in case a
+dialog has multiple owned wrapper windows. Both commands operate only on the
+SketchUp process that owns the configured localhost listener port.
+
 Once connected, Codex, opencode, or another MCP client can interact with Sketchup using the following capabilities:
 
 #### Tools
@@ -241,6 +249,8 @@ Once connected, Codex, opencode, or another MCP client can interact with Sketchu
 * `get_selection` - Gets information about currently selected components
 * `allow_sketchup_autostart` - Allow this MCP process to start Sketchup after the user approves
 * `set_connection_port` - Switch this MCP server process to another Sketchup Ruby TCP port
+* `get_modal_state` - Inspect whether the configured local SketchUp process currently has a modal window
+* `close_modal` - Close a detected modal window owned by the configured local SketchUp process
 * `create_component` - Create a new component with specified parameters
 * `delete_component` - Remove a component from the scene
 * `transform_component` - Move, rotate, or scale a component

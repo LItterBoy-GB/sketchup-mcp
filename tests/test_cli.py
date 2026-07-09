@@ -103,6 +103,53 @@ class CliEvalTests(unittest.TestCase):
         self.assertEqual(sent["params"], {"code": "1 + 1", "prevent_modal_hang": True})
         self.assertEqual(sent["request_id"], 1)
 
+    def test_modal_state_uses_modal_guard_without_tcp_connection(self):
+        expected = {
+            "success": True,
+            "status": "modal_detected",
+            "is_modal": True,
+            "pid": 42,
+            "modal": {"title": "EW Example"},
+        }
+        stdout = io.StringIO()
+
+        with (
+            patch.object(cli, "SketchupConnection", side_effect=AssertionError("should not connect")),
+            patch.object(cli.modal_guard, "modal_state_for_port", return_value=expected) as state_for_port,
+        ):
+            exit_code = cli.main(
+                ["--host", "127.0.0.1", "--port", "9877", "modal-state"],
+                stdout=stdout,
+            )
+
+        self.assertEqual(exit_code, 0)
+        state_for_port.assert_called_once_with("127.0.0.1", 9877, request_id=1)
+        self.assertEqual(json.loads(stdout.getvalue()), expected)
+
+    def test_close_modal_uses_modal_guard_without_tcp_connection(self):
+        expected = {
+            "success": True,
+            "status": "modal_closed",
+            "is_modal": True,
+            "closed": True,
+            "pid": 42,
+            "modal": {"title": "EW Example", "action": "wm_close"},
+        }
+        stdout = io.StringIO()
+
+        with (
+            patch.object(cli, "SketchupConnection", side_effect=AssertionError("should not connect")),
+            patch.object(cli.modal_guard, "close_modal_for_port", return_value=expected) as close_for_port,
+        ):
+            exit_code = cli.main(
+                ["--host", "127.0.0.1", "--port", "9877", "close-modal"],
+                stdout=stdout,
+            )
+
+        self.assertEqual(exit_code, 0)
+        close_for_port.assert_called_once_with("127.0.0.1", 9877, request_id=1)
+        self.assertEqual(json.loads(stdout.getvalue()), expected)
+
     def test_ping_sends_protocol_request_instead_of_connect_probe(self):
         sent = {}
 

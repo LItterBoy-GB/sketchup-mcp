@@ -77,6 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("ping", help="Check that the Sketchup Ruby extension TCP port is reachable")
+    subparsers.add_parser("modal-state", help="Inspect whether the configured SketchUp process has a modal window")
+    subparsers.add_parser("close-modal", help="Close a detected modal window owned by the configured SketchUp process")
 
     eval_parser = subparsers.add_parser("eval", help="Evaluate Ruby code in Sketchup")
     eval_parser.add_argument("code", nargs="?", help="Ruby code to evaluate")
@@ -165,6 +167,18 @@ def main(
 
     try:
         apply_startup_options(args)
+        if args.command == "modal-state":
+            host = args.host or get_sketchup_host()
+            port = args.port if args.port is not None else get_sketchup_port()
+            _write_json(stdout, modal_guard.modal_state_for_port(host, port, request_id=1))
+            return 0
+
+        if args.command == "close-modal":
+            host = args.host or get_sketchup_host()
+            port = args.port if args.port is not None else get_sketchup_port()
+            _write_json(stdout, modal_guard.close_modal_for_port(host, port, request_id=1))
+            return 0
+
         connection = _connection(args)
         if args.command == "ping":
             connection.send_command("ping", {}, request_id=1)

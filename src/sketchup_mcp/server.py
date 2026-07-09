@@ -226,6 +226,7 @@ class SketchupConnection:
                     raise
         except socket.timeout:
             logger.warning("Socket timeout during chunked receive")
+            raise
         except Exception as e:
             logger.error(f"Error during receive: {str(e)}")
             raise
@@ -526,6 +527,36 @@ def set_connection_port(ctx: Context, port: int) -> str:
             "host": get_sketchup_host(),
             "port": target_port,
         })
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+        })
+
+@mcp.tool()
+def get_modal_state(ctx: Context) -> str:
+    """Inspect whether the configured local SketchUp process currently has a modal window."""
+    try:
+        return json.dumps(modal_guard.modal_state_for_port(
+            get_sketchup_host(),
+            get_sketchup_port(),
+            request_id=ctx.request_id,
+        ))
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+        })
+
+@mcp.tool()
+def close_modal(ctx: Context) -> str:
+    """Close a detected modal window owned by the configured local SketchUp process."""
+    try:
+        return json.dumps(modal_guard.close_modal_for_port(
+            get_sketchup_host(),
+            get_sketchup_port(),
+            request_id=ctx.request_id,
+        ))
     except Exception as e:
         return json.dumps({
             "success": False,
