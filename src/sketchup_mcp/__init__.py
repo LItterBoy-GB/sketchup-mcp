@@ -1,6 +1,6 @@
 """Sketchup integration through Model Context Protocol"""
 
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 
 def __getattr__(name):
     if name == "mcp":
