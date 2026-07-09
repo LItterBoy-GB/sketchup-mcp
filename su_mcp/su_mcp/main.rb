@@ -13,6 +13,21 @@ module SU_MCP
     SETTINGS_NAMESPACE = "SU_MCP"
     SETTINGS_PORT_KEY = "port"
     EVAL_RUBY_UI_GUARD_METHODS = [:messagebox, :openpanel, :savepanel, :inputbox].freeze
+    EVAL_RUBY_UI_FALLBACK_CONSTANTS = {
+      MB_OK: 0,
+      MB_OKCANCEL: 1,
+      MB_ABORTRETRYIGNORE: 2,
+      MB_YESNOCANCEL: 3,
+      MB_YESNO: 4,
+      MB_RETRYCANCEL: 5,
+      IDOK: 1,
+      IDCANCEL: 2,
+      IDABORT: 3,
+      IDRETRY: 4,
+      IDIGNORE: 5,
+      IDYES: 6,
+      IDNO: 7
+    }.freeze
 
     attr_reader :port
 
@@ -345,9 +360,7 @@ module SU_MCP
         originals.each do |method_name, original|
           if original[:defined]
             original_method = original[:method]
-            ui_singleton.define_method(method_name) do |*args, &block|
-              original_method.call(*args, &block)
-            end
+            ui_singleton.define_method(method_name, original_method)
           elsif UI.respond_to?(method_name)
             ui_singleton.remove_method(method_name)
           end
@@ -380,7 +393,13 @@ module SU_MCP
     end
 
     def eval_ruby_ui_constant(name)
-      UI.const_defined?(name) ? UI.const_get(name) : nil
+      if Object.const_defined?(name, false)
+        Object.const_get(name)
+      elsif UI.const_defined?(name, false)
+        UI.const_get(name)
+      else
+        EVAL_RUBY_UI_FALLBACK_CONSTANTS[name]
+      end
     end
 
     def append_eval_ruby_ui_event(ui_events, api, args, result)

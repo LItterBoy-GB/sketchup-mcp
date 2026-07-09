@@ -4,19 +4,34 @@ require "tmpdir"
 
 RUBY_MAIN = File.expand_path("../su_mcp/su_mcp/main.rb", __dir__)
 
-module UI
-  MB_OK = 0 unless const_defined?(:MB_OK)
-  MB_OKCANCEL = 1 unless const_defined?(:MB_OKCANCEL)
-  MB_ABORTRETRYIGNORE = 2 unless const_defined?(:MB_ABORTRETRYIGNORE)
-  MB_YESNOCANCEL = 3 unless const_defined?(:MB_YESNOCANCEL)
-  MB_YESNO = 4 unless const_defined?(:MB_YESNO)
-  MB_RETRYCANCEL = 5 unless const_defined?(:MB_RETRYCANCEL)
-  MB_ICONQUESTION = 0x20 unless const_defined?(:MB_ICONQUESTION)
+MB_OK = 0 unless Object.const_defined?(:MB_OK, false)
+MB_OKCANCEL = 1 unless Object.const_defined?(:MB_OKCANCEL, false)
+MB_ABORTRETRYIGNORE = 2 unless Object.const_defined?(:MB_ABORTRETRYIGNORE, false)
+MB_YESNOCANCEL = 3 unless Object.const_defined?(:MB_YESNOCANCEL, false)
+MB_YESNO = 4 unless Object.const_defined?(:MB_YESNO, false)
+MB_RETRYCANCEL = 5 unless Object.const_defined?(:MB_RETRYCANCEL, false)
+MB_ICONQUESTION = 0x20 unless Object.const_defined?(:MB_ICONQUESTION, false)
 
-  IDOK = 10 unless const_defined?(:IDOK)
-  IDCANCEL = 11 unless const_defined?(:IDCANCEL)
-  IDABORT = 12 unless const_defined?(:IDABORT)
-  IDNO = 13 unless const_defined?(:IDNO)
+IDOK = 10 unless Object.const_defined?(:IDOK, false)
+IDCANCEL = 11 unless Object.const_defined?(:IDCANCEL, false)
+IDABORT = 12 unless Object.const_defined?(:IDABORT, false)
+IDYES = 14 unless Object.const_defined?(:IDYES, false)
+IDNO = 13 unless Object.const_defined?(:IDNO, false)
+
+module UI
+  MB_OK = ::MB_OK unless const_defined?(:MB_OK, false)
+  MB_OKCANCEL = ::MB_OKCANCEL unless const_defined?(:MB_OKCANCEL, false)
+  MB_ABORTRETRYIGNORE = ::MB_ABORTRETRYIGNORE unless const_defined?(:MB_ABORTRETRYIGNORE, false)
+  MB_YESNOCANCEL = ::MB_YESNOCANCEL unless const_defined?(:MB_YESNOCANCEL, false)
+  MB_YESNO = ::MB_YESNO unless const_defined?(:MB_YESNO, false)
+  MB_RETRYCANCEL = ::MB_RETRYCANCEL unless const_defined?(:MB_RETRYCANCEL, false)
+  MB_ICONQUESTION = ::MB_ICONQUESTION unless const_defined?(:MB_ICONQUESTION, false)
+
+  IDOK = ::IDOK unless const_defined?(:IDOK, false)
+  IDCANCEL = ::IDCANCEL unless const_defined?(:IDCANCEL, false)
+  IDABORT = ::IDABORT unless const_defined?(:IDABORT, false)
+  IDYES = ::IDYES unless const_defined?(:IDYES, false)
+  IDNO = ::IDNO unless const_defined?(:IDNO, false)
 end
 
 def extract_method_source(source, method_name, required: true)
@@ -40,6 +55,21 @@ end
 class EvalRubyLoggingTest < Minitest::Test
   class Harness
     EVAL_RUBY_UI_GUARD_METHODS = [:messagebox, :openpanel, :savepanel, :inputbox].freeze
+    EVAL_RUBY_UI_FALLBACK_CONSTANTS = {
+      MB_OK: 0,
+      MB_OKCANCEL: 1,
+      MB_ABORTRETRYIGNORE: 2,
+      MB_YESNOCANCEL: 3,
+      MB_YESNO: 4,
+      MB_RETRYCANCEL: 5,
+      IDOK: 1,
+      IDCANCEL: 2,
+      IDABORT: 3,
+      IDRETRY: 4,
+      IDIGNORE: 5,
+      IDYES: 6,
+      IDNO: 7
+    }.freeze
 
     attr_reader :logs
 
@@ -206,18 +236,18 @@ class EvalRubyLoggingTest < Minitest::Test
       harness = Harness.new(dir)
       code = <<~RUBY
         [
-          UI.messagebox('ok', UI::MB_OK),
-          UI.messagebox('cancel', UI::MB_OKCANCEL),
-          UI.messagebox('no', UI::MB_YESNO),
-          UI.messagebox('cancel wins', UI::MB_YESNOCANCEL),
-          UI.messagebox('abort', UI::MB_ABORTRETRYIGNORE)
+          UI.messagebox('ok', MB_OK),
+          UI.messagebox('cancel', MB_OKCANCEL),
+          UI.messagebox('no', MB_YESNO),
+          UI.messagebox('cancel wins', MB_YESNOCANCEL),
+          UI.messagebox('abort', MB_ABORTRETRYIGNORE)
         ].join(',')
       RUBY
 
       result = harness.eval_ruby("code" => code, "prevent_modal_hang" => true)
 
       assert_equal true, result[:success]
-      assert_equal [UI::IDOK, UI::IDCANCEL, UI::IDNO, UI::IDCANCEL, UI::IDABORT].join(","), result[:result]
+      assert_equal [IDOK, IDCANCEL, IDNO, IDCANCEL, IDABORT].join(","), result[:result]
       assert_equal 5, result[:ui_events].length
     end
   end
@@ -227,15 +257,15 @@ class EvalRubyLoggingTest < Minitest::Test
       harness = Harness.new(dir)
       code = <<~RUBY
         [
-          UI.messagebox('ok with icon', UI::MB_OK | UI::MB_ICONQUESTION),
-          UI.messagebox('no with icon', UI::MB_YESNO | UI::MB_ICONQUESTION)
+          UI.messagebox('ok with icon', MB_OK | MB_ICONQUESTION),
+          UI.messagebox('no with icon', MB_YESNO | MB_ICONQUESTION)
         ].join(',')
       RUBY
 
       result = harness.eval_ruby("code" => code, "prevent_modal_hang" => true)
 
       assert_equal true, result[:success]
-      assert_equal [UI::IDOK, UI::IDNO].join(","), result[:result]
+      assert_equal [IDOK, IDNO].join(","), result[:result]
     end
   end
 
@@ -243,6 +273,7 @@ class EvalRubyLoggingTest < Minitest::Test
     Dir.mktmpdir do |dir|
       harness = Harness.new(dir)
       UI.define_singleton_method(:openpanel) { |_title| "original" }
+      original_method = UI.method(:openpanel)
 
       error = assert_raises(RuntimeError) do
         harness.eval_ruby(
@@ -252,6 +283,7 @@ class EvalRubyLoggingTest < Minitest::Test
       end
 
       assert_equal "Ruby evaluation error: boom", error.message
+      assert_equal original_method, UI.method(:openpanel)
       assert_equal "original", UI.openpanel("Pick file")
     end
   ensure
