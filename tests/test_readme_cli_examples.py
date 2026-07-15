@@ -45,7 +45,7 @@ class ReadmeCliExamplesTests(unittest.TestCase):
         self.assertIn(r".\.venv\Scripts\Activate.ps1", readme)
         self.assertIn("uvx --from . sketchup-mcp-cli --help", readme)
 
-    def test_autostart_and_conversation_port_switch_are_documented(self):
+    def test_autostart_and_request_scoped_port_routing_are_documented(self):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn("SKETCHUP_MCP_AUTOSTART", readme)
@@ -55,7 +55,22 @@ class ReadmeCliExamplesTests(unittest.TestCase):
         self.assertIn("ask the user whether", readme)
         self.assertIn("allow_sketchup_autostart", readme)
         self.assertIn("set_connection_port", readme)
+        self.assertIn("Every SketchUp tool accepts an optional `port`", readme)
+        self.assertIn("list_sketchup_instances", readme)
+        self.assertIn("get_instance_info", readme)
+        self.assertIn("2-second read-only timeout with no retries", readme)
+        self.assertIn("never start SketchUp", readme)
+        self.assertNotIn("[mcp_servers.sketchup_9877]", readme)
         self.assertIn("--start-sketchup-if-needed", readme)
+
+    def test_chinese_readme_documents_request_scoped_port_routing(self):
+        readme = Path("README.zh-CN.md").read_text(encoding="utf-8")
+
+        self.assertIn("所有 SketchUp 工具都支持可选 `port`", readme)
+        self.assertIn("list_sketchup_instances", readme)
+        self.assertIn("get_instance_info", readme)
+        self.assertIn("2 秒只读超时、不重试", readme)
+        self.assertIn("不会自动启动 SketchUp", readme)
 
     def test_tcp_protocol_framing_is_documented(self):
         readme = Path("README.md").read_text(encoding="utf-8")

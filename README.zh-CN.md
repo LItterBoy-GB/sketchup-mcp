@@ -94,26 +94,13 @@ SKETCHUP_MCP_REQUEST_TIMEOUT_MS = "15000"
 SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "3600"
 ```
 
-自动启动只会在用户已批准后生效：要么通过当前 MCP 进程中的 `allow_sketchup_autostart` 批准，要么通过 `SKETCHUP_MCP_AUTOSTART=1` 预先批准。MCP server 启动探测不会自动启动 SketchUp，因此如果需要非默认端口，可以先在对话里调用 `set_connection_port`。
+自动启动只会在用户已批准后生效：要么通过当前 MCP 进程中的 `allow_sketchup_autostart` 批准，要么通过 `SKETCHUP_MCP_AUTOSTART=1` 预先批准。工具显式传入 `port` 时，只会尝试启动该端口对应的 SketchUp，绝不会回退到其他端口。
 
 每个 Python 到 SketchUp 的请求都会包含发送时间戳和 `SKETCHUP_MCP_REQUEST_TIMEOUT_MS`。如果 SketchUp 正忙，直到超时后才处理 socket，请求会被 Ruby 扩展丢弃，不会继续执行过期命令。
 
 `SKETCHUP_MCP_IDLE_TIMEOUT_SEC` 控制空闲 stdio MCP 进程在最后一次 SketchUp 命令后可以存活多久。设置为 `0` 可以关闭空闲 watchdog。
 
-如果需要连接第二个 SketchUp 实例，可以添加另一个 MCP server 名称，并使用不同端口：
-
-```toml
-[mcp_servers.sketchup_9877]
-command = "uvx"
-args = ["sketchup-mcp"]
-startup_timeout_sec = 20
-tool_timeout_sec = 300
-
-[mcp_servers.sketchup_9877.env]
-SKETCHUP_MCP_PORT = "9877"
-```
-
-修改配置后重启 Codex。
+`SKETCHUP_MCP_PORT` 只定义默认目标端口。一个 MCP server 已可按每次工具调用的显式 `port` 路由到不同的本机 SketchUp，因此日常多实例操作不再需要为每个端口额外配置 MCP server。
 
 ### opencode
 
@@ -138,31 +125,7 @@ opencode 可以通过 `opencode mcp add` 或 `opencode.json` 配置 MCP。项目
 }
 ```
 
-多个 SketchUp 实例可以配置多个本地 MCP 入口，并为每个 SketchUp 窗口分配一个端口：
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "sketchup_9876": {
-      "type": "local",
-      "command": ["uvx", "sketchup-mcp"],
-      "enabled": true,
-      "environment": {
-        "SKETCHUP_MCP_PORT": "9876"
-      }
-    },
-    "sketchup_9877": {
-      "type": "local",
-      "command": ["uvx", "sketchup-mcp"],
-      "enabled": true,
-      "environment": {
-        "SKETCHUP_MCP_PORT": "9877"
-      }
-    }
-  }
-}
-```
+多个 SketchUp 实例只需保留一个本地 MCP 入口。给每个 SketchUp 窗口分配不同的 Ruby listener 端口，然后在对应 MCP 工具调用中传入 `port`。
 
 ## 使用
 
@@ -172,7 +135,7 @@ opencode 可以通过 `opencode mcp add` 或 `opencode.json` 配置 MCP。项目
 2. server 会在默认端口 `9876` 上启动。
 3. 启动 Codex、opencode 或其他已配置的 MCP 客户端。
 
-SketchUp 的 `Extensions > MCP Server` 菜单是本地 server 控制面板。`Start Server` 启动 Ruby 侧 TCP listener，`Stop Server` 暂停服务，`Current Port` 显示当前监听端口，`Set Port...` 可以在启动前修改端口。多 MCP 连接场景下，给每个 SketchUp 实例分配不同端口，然后在 MCP 客户端配置中使用匹配的 `SKETCHUP_MCP_PORT`。
+SketchUp 的 `Extensions > MCP Server` 菜单是本地 server 控制面板。`Start Server` 启动 Ruby 侧 TCP listener，`Stop Server` 暂停服务，`Current Port` 显示当前监听端口，`Set Port...` 可以在启动前修改端口。多实例场景下，给每个 SketchUp 实例分配不同端口即可。
 
 ![MCP Server 菜单，显示当前端口、设置端口、启动和停止控制](docs/images/mcp-server-menu.png)
 
@@ -184,16 +147,16 @@ SketchUp 的 `Extensions > MCP Server` 菜单是本地 server 控制面板。`St
 2. 输入一个端口，例如 `9876`、`9877` 或 `9878`。
 3. 使用 Current Port 菜单项确认当前端口。
 4. 通过 Extensions > MCP Server > Start Server 启动 server。
-5. 使用相同端口启动匹配的 MCP server。
+5. 在 MCP 对话中调用 `list_sketchup_instances` 确认已运行窗口，或直接使用已知端口。
 
-在 MCP 对话中，可以在调用其他 SketchUp 工具前通过 `set_connection_port` 切换当前 MCP 进程连接的 SketchUp 端口。例如先调用 `set_connection_port` 设置为 `9877`，再调用 `get_selection` 或 `eval_ruby`。
+所有 SketchUp 工具都支持可选 `port`。例如调用
+`eval_ruby(code="Sketchup.active_model.title", port=9877)` 或
+`get_selection(port=9876)`。显式端口只作用于本次请求，因此不同 SketchUp 窗口可以并发处理而不会改写彼此默认目标。`set_connection_port` 保留为未传 `port` 时的默认端口设置。
 
-PowerShell 示例：
-
-```powershell
-$env:SKETCHUP_MCP_PORT = "9877"
-uvx sketchup-mcp
-```
+`list_sketchup_instances` 会检查已注册的 listener，以及通过 `ports=[...]`
+显式传入的端口。各端口的身份探针并行执行，采用 2 秒只读超时、不重试，
+也不会自动启动 SketchUp。无响应 listener 会进入 `unavailable`；发现过程
+不会盲扫任意端口，也不会回退到其他实例。
 
 ### 直接使用 CLI
 
@@ -222,9 +185,11 @@ sketchup-mcp-cli --port 9877 --start-sketchup-if-needed --sketchup-exe "C:\Progr
 
 * `get_selection` - 获取当前选中组件的信息。
 * `allow_sketchup_autostart` - 用户批准后，允许当前 MCP 进程启动 SketchUp。
-* `set_connection_port` - 将当前 MCP server 进程切换到另一个 SketchUp Ruby TCP 端口。
-* `get_modal_state` - 检查当前配置的本地 SketchUp 进程是否存在模态窗口。
-* `close_modal` - 关闭当前配置的本地 SketchUp 进程下检测到的模态窗口。
+* `set_connection_port` - 设置未传 `port` 时使用的默认 SketchUp Ruby TCP 端口。
+* `get_instance_info` - 读取目标实例的 PID、端口、SketchUp 版本、模型和页面。
+* `list_sketchup_instances` - 并行检查已注册或显式传入的 listener，不会盲扫任意端口或自动启动 SketchUp。
+* `get_modal_state` - 检查目标 SketchUp 进程是否存在模态窗口。
+* `close_modal` - 关闭目标 SketchUp 进程下检测到的模态窗口。
 * `create_component` - 按指定参数创建新组件。
 * `delete_component` - 从场景中删除组件。
 * `transform_component` - 移动、旋转或缩放组件。

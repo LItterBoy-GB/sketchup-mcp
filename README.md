@@ -103,9 +103,8 @@ SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "3600"
 
 Autostart runs only after the user has approved it, either through
 `allow_sketchup_autostart` in the current MCP process or through the
-`SKETCHUP_MCP_AUTOSTART=1` pre-approval setting. The MCP server startup probe
-does not launch Sketchup, so a conversation can call `set_connection_port` first
-when it needs a non-default port.
+`SKETCHUP_MCP_AUTOSTART=1` pre-approval setting. An explicit tool `port` only
+starts that requested SketchUp instance; it never falls back to another port.
 
 Every Python-to-Sketchup request includes a send timestamp and
 `SKETCHUP_MCP_REQUEST_TIMEOUT_MS`. If Sketchup is busy and only handles the
@@ -116,20 +115,9 @@ request without executing it.
 can stay alive after its last Sketchup command. Set it to `0` to disable the
 idle watchdog.
 
-For a second Sketchup instance, add another server name and a different port:
-
-```toml
-[mcp_servers.sketchup_9877]
-command = "uvx"
-args = ["sketchup-mcp"]
-startup_timeout_sec = 20
-tool_timeout_sec = 300
-
-[mcp_servers.sketchup_9877.env]
-SKETCHUP_MCP_PORT = "9877"
-```
-
-Restart Codex after changing the config.
+`SKETCHUP_MCP_PORT` is only the default target. One MCP entry can route each
+tool call to any explicitly supplied local SketchUp port, so extra MCP entries
+are no longer required for normal multi-instance work.
 
 ### opencode
 
@@ -155,32 +143,9 @@ For a project-local setup, create `opencode.json` in the project root:
 }
 ```
 
-For multiple Sketchup instances, add more local MCP entries and use one port
-per Sketchup window:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "sketchup_9876": {
-      "type": "local",
-      "command": ["uvx", "sketchup-mcp"],
-      "enabled": true,
-      "environment": {
-        "SKETCHUP_MCP_PORT": "9876"
-      }
-    },
-    "sketchup_9877": {
-      "type": "local",
-      "command": ["uvx", "sketchup-mcp"],
-      "enabled": true,
-      "environment": {
-        "SKETCHUP_MCP_PORT": "9877"
-      }
-    }
-  }
-}
-```
+For multiple Sketchup instances, keep one local MCP entry. Give each SketchUp
+window a distinct Ruby listener port, then include `port` in the MCP tool call
+that targets that window.
 
 ## Usage
 
@@ -193,9 +158,8 @@ per Sketchup window:
 Use the Sketchup `Extensions > MCP Server` menu as the local server control
 panel. `Start Server` starts the Ruby-side TCP listener, `Stop Server` pauses
 it, `Current Port` shows the active listener port, and `Set Port...` changes
-the port before starting a server. For multiple MCP connections, assign each
-Sketchup instance a different port here, then use the matching
-`SKETCHUP_MCP_PORT` in the MCP client configuration.
+the port before starting a server. Assign each Sketchup instance a different
+port when several models must be controlled at once.
 
 ![MCP Server menu showing current port, set port, start, and stop controls](docs/images/mcp-server-menu.png)
 
@@ -208,19 +172,21 @@ instances at the same time, give each Sketchup instance a different port:
 2. Enter a port such as `9876`, `9877`, or `9878`
 3. Use the Current Port menu item to confirm the active port
 4. Start the server from Extensions > MCP Server > Start Server
-5. Start the matching MCP server with the same port
+5. In the MCP conversation, call `list_sketchup_instances` to confirm the
+   running windows, or use the known port directly.
 
-From an MCP conversation, switch the current MCP process to another Sketchup
-port by calling `set_connection_port` before other Sketchup tools. For example,
-call `set_connection_port` with `9877`, then call `get_selection` or
-`eval_ruby`.
+Every SketchUp tool accepts an optional `port`. For example, use
+`eval_ruby(code="Sketchup.active_model.title", port=9877)` or
+`get_selection(port=9876)`. The explicit port is request-scoped, so concurrent
+commands can target separate SketchUp windows without changing each other's
+default. `set_connection_port` remains available only as a default for calls
+that omit `port`.
 
-PowerShell example:
-
-```powershell
-$env:SKETCHUP_MCP_PORT = "9877"
-uvx sketchup-mcp
-```
+`list_sketchup_instances` checks registered listeners and any ports explicitly
+provided through `ports=[...]`. Identity checks run concurrently, use a
+2-second read-only timeout with no retries, and never start SketchUp. A listener
+that does not respond is returned under `unavailable`; discovery does not scan
+arbitrary ports or fall back to a different instance.
 
 ### Direct CLI
 
@@ -259,9 +225,11 @@ Once connected, Codex, opencode, or another MCP client can interact with Sketchu
 
 * `get_selection` - Gets information about currently selected components
 * `allow_sketchup_autostart` - Allow this MCP process to start Sketchup after the user approves
-* `set_connection_port` - Switch this MCP server process to another Sketchup Ruby TCP port
-* `get_modal_state` - Inspect whether the configured local SketchUp process currently has a modal window
-* `close_modal` - Close a detected modal window owned by the configured local SketchUp process
+* `set_connection_port` - Set the default Sketchup Ruby TCP port for calls that omit `port`
+* `get_instance_info` - Read a target instance's PID, port, SketchUp version, model, and page
+* `list_sketchup_instances` - Concurrently check registered or explicitly supplied listeners without scanning arbitrary ports or starting SketchUp
+* `get_modal_state` - Inspect whether the target SketchUp process has a modal window
+* `close_modal` - Close a detected modal window owned by the target SketchUp process
 * `create_component` - Create a new component with specified parameters
 * `delete_component` - Remove a component from the scene
 * `transform_component` - Move, rotate, or scale a component

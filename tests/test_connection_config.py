@@ -1,7 +1,8 @@
 import unittest
+import asyncio
 import json
 import socket
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from sketchup_mcp import server
 
@@ -12,12 +13,6 @@ class ConnectionConfigTests(unittest.TestCase):
         server.startup.clear_session_autostart_allowed()
         server._active_request_count = 0
         server._last_activity_monotonic = 0.0
-        if server._sketchup_connection is not None:
-            try:
-                server._sketchup_connection.disconnect()
-            except Exception:
-                pass
-            server._sketchup_connection = None
 
     def test_default_connection_target_uses_default_port(self):
         self.assertEqual(server.get_sketchup_host(), "localhost")
@@ -62,6 +57,11 @@ class ConnectionConfigTests(unittest.TestCase):
             server.set_sketchup_port_override(9877)
 
             self.assertEqual(server.get_sketchup_port(), 9877)
+
+    def test_explicit_request_port_overrides_session_and_environment(self):
+        with patch.dict("os.environ", {"SKETCHUP_MCP_PORT": "9876"}):
+            server.set_sketchup_port_override(9877)
+            self.assertEqual(server.get_sketchup_port(9878), 9878)
 
     def test_set_connection_port_tool_returns_current_target(self):
         result = server.set_connection_port(None, 9878)
@@ -119,21 +119,26 @@ class ConnectionConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "Ask the user whether to start SketchUp"):
                 server.get_sketchup_connection()
 
-    def test_cached_connection_is_returned_without_probe_ping(self):
-        calls = []
+    def test_direct_connection_is_not_cached(self):
+        created = []
 
-        class FakeSocket:
-            def sendall(self, payload):
-                calls.append(payload)
+        class FakeConnection:
+            def __init__(self, host, port):
+                self.host = host
+                self.port = port
+                created.append(self)
 
-            def close(self):
-                pass
+            def connect(self, allow_autostart=True):
+                return True
 
-        cached = server.SketchupConnection(host="localhost", port=9876, sock=FakeSocket())
-        server._sketchup_connection = cached
+        with patch.object(server, "SketchupConnection", FakeConnection):
+            first = server.get_sketchup_connection()
+            second = server.get_sketchup_connection()
 
-        self.assertIs(server.get_sketchup_connection(), cached)
-        self.assertEqual(calls, [])
+        self.assertEqual(len(created), 2)
+        self.assertIs(first, created[0])
+        self.assertIs(second, created[1])
+        self.assertIsNot(created[0], created[1])
 
     def test_request_metadata_includes_sent_at_and_timeout(self):
         sent = {}
@@ -221,27 +226,30 @@ class ConnectionConfigTests(unittest.TestCase):
     def test_eval_ruby_tool_passes_prevent_modal_hang_to_sketchup(self):
         sent = {}
 
-        class FakeConnection:
-            def send_command(self, method, params=None, request_id=None):
-                sent["method"] = method
-                sent["params"] = params
-                sent["request_id"] = request_id
-                return {
-                    "content": [{"text": "2"}],
-                    "ui_events": [{"api": "UI.messagebox", "result": "IDNO"}],
-                }
-
         class FakeContext:
             request_id = 123
 
-        with patch.object(server, "get_sketchup_connection", return_value=FakeConnection()):
-            response = json.loads(server.eval_ruby(FakeContext(), "1 + 1", prevent_modal_hang=True))
+        async def send_tool(name, arguments, request_id, *, port=None, allow_autostart=True):
+            sent["method"] = "tools/call"
+            sent["params"] = {"name": name, "arguments": arguments}
+            sent["request_id"] = request_id
+            return (
+                {
+                    "content": [{"text": "2"}],
+                    "ui_events": [{"api": "UI.messagebox", "result": "IDNO"}],
+                },
+                {"host": "localhost", "port": port},
+            )
+
+        with patch.object(server, "_send_ruby_tool", new=AsyncMock(side_effect=send_tool)):
+            response = json.loads(asyncio.run(server.eval_ruby(FakeContext(), "1 + 1", prevent_modal_hang=True, port=9878)))
 
         self.assertEqual(sent["method"], "tools/call")
         self.assertEqual(sent["params"]["name"], "eval_ruby")
         self.assertEqual(sent["params"]["arguments"], {"code": "1 + 1", "prevent_modal_hang": True})
         self.assertEqual(sent["request_id"], 123)
         self.assertEqual(response["result"], "2")
+        self.assertEqual(response["target"], {"host": "localhost", "port": 9878})
         self.assertEqual(response["ui_events"], [{"api": "UI.messagebox", "result": "IDNO"}])
 
     def test_get_modal_state_uses_configured_connection_target_without_ruby_request(self):
@@ -256,14 +264,10 @@ class ConnectionConfigTests(unittest.TestCase):
             "modal": {"title": "EW Example"},
         }
 
-        with (
-            patch.object(server, "get_sketchup_connection") as connection,
-            patch.object(server.modal_guard, "modal_state_for_port", return_value=expected) as state_for_port,
-        ):
-            response = json.loads(server.get_modal_state(FakeContext()))
+        with patch.object(server.modal_guard, "modal_state_for_port", return_value=expected) as state_for_port:
+            response = json.loads(asyncio.run(server.get_modal_state(FakeContext(), port=9877)))
 
-        connection.assert_not_called()
-        state_for_port.assert_called_once_with("localhost", 9876, request_id=123)
+        state_for_port.assert_called_once_with("localhost", 9877, request_id=123)
         self.assertEqual(response, expected)
 
     def test_close_modal_uses_configured_connection_target_without_ruby_request(self):
@@ -279,14 +283,10 @@ class ConnectionConfigTests(unittest.TestCase):
             "modal": {"title": "EW Example", "action": "wm_close"},
         }
 
-        with (
-            patch.object(server, "get_sketchup_connection") as connection,
-            patch.object(server.modal_guard, "close_modal_for_port", return_value=expected) as close_for_port,
-        ):
-            response = json.loads(server.close_modal(FakeContext()))
+        with patch.object(server.modal_guard, "close_modal_for_port", return_value=expected) as close_for_port:
+            response = json.loads(asyncio.run(server.close_modal(FakeContext(), port=9877)))
 
-        connection.assert_not_called()
-        close_for_port.assert_called_once_with("localhost", 9876, request_id=123)
+        close_for_port.assert_called_once_with("localhost", 9877, request_id=123)
         self.assertEqual(response, expected)
 
     def test_modal_guard_runs_on_eval_timeout_when_prevent_modal_hang_enabled(self):
@@ -340,7 +340,7 @@ class ConnectionConfigTests(unittest.TestCase):
 
         connection = server.SketchupConnection(host="localhost", port=9876, sock=FakeSocket())
 
-        def reconnect():
+        def reconnect(*args, **kwargs):
             connection.sock = FakeSocket()
             return True
 

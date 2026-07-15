@@ -5,7 +5,7 @@ require 'fileutils'
 
 # Configuration
 EXTENSION_NAME = 'su_mcp'
-VERSION = '1.6.0'
+VERSION = '1.7.0'
 OUTPUT_NAME = "#{EXTENSION_NAME}_v#{VERSION}.rbz"
 
 # Create temp directory
@@ -32,4 +32,4 @@ end
 # Clean up
 FileUtils.rm_rf(temp_dir)
 
-puts "Created #{OUTPUT_NAME}" 
+puts "Created #{OUTPUT_NAME}"

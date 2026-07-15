@@ -2,6 +2,8 @@ require 'sketchup'
 require 'json'
 require 'socket'
 require 'fileutils'
+require 'tmpdir'
+require 'securerandom'
 
 puts "MCP Extension loading..."
 SKETCHUP_CONSOLE.show rescue nil
@@ -12,6 +14,8 @@ module SU_MCP
     CLIENT_READ_TIMEOUT_SEC = 0.5
     SETTINGS_NAMESPACE = "SU_MCP"
     SETTINGS_PORT_KEY = "port"
+    INSTANCE_REGISTRY_SCHEMA_VERSION = 1
+    INSTANCE_PROTOCOL_VERSION = 1
     EVAL_RUBY_UI_GUARD_METHODS = [:messagebox, :openpanel, :savepanel, :inputbox].freeze
     EVAL_RUBY_UI_FALLBACK_CONSTANTS = {
       MB_OK: 0,
@@ -37,6 +41,8 @@ module SU_MCP
       @running = false
       @timer_id = nil
       @port_command = nil
+      @instance_id = SecureRandom.uuid
+      @started_at_ms = (Time.now.to_f * 1000).to_i
       
       # Try multiple ways to show console
       begin
@@ -132,6 +138,7 @@ module SU_MCP
         
         @server = TCPServer.new('127.0.0.1', @port)
         log "Server created on port #{@port}"
+        write_instance_registry
         
         @running = true
         
@@ -233,6 +240,7 @@ module SU_MCP
       
       @server.close if @server
       @server = nil
+      remove_instance_registry
       log "Server stopped"
     end
 
@@ -244,6 +252,48 @@ module SU_MCP
 
       port = text.to_i
       self.class.valid_port?(port) ? port : nil
+    end
+
+    def instance_registry_dir
+      File.join(Dir.tmpdir, 'sketchup-mcp', 'instances')
+    end
+
+    def instance_registry_path
+      File.join(instance_registry_dir, "#{Process.pid}.json")
+    end
+
+    def write_instance_registry
+      FileUtils.mkdir_p(instance_registry_dir)
+      payload = {
+        schema_version: INSTANCE_REGISTRY_SCHEMA_VERSION,
+        instance_id: @instance_id,
+        pid: Process.pid,
+        port: @port,
+        protocol_version: INSTANCE_PROTOCOL_VERSION,
+        started_at_ms: @started_at_ms
+      }
+      path = instance_registry_path
+      temp_path = "#{path}.tmp"
+      File.open(temp_path, 'w:UTF-8') { |file| file.write(JSON.generate(payload)) }
+      File.delete(path) if File.exist?(path)
+      File.rename(temp_path, path)
+      log "Registered listener at #{path}"
+    rescue StandardError => e
+      log "Failed to register listener: #{e.message}"
+      File.delete(temp_path) if defined?(temp_path) && File.exist?(temp_path)
+    end
+
+    def remove_instance_registry
+      path = instance_registry_path
+      return unless File.exist?(path)
+
+      payload = JSON.parse(File.read(path, encoding: 'UTF-8'))
+      return unless payload['instance_id'] == @instance_id
+
+      File.delete(path)
+      log "Removed listener registry #{path}"
+    rescue StandardError => e
+      log "Failed to remove listener registry: #{e.message}"
     end
 
     def update_port_menu_text
@@ -595,6 +645,24 @@ module SU_MCP
       end
     end
 
+    def get_instance_info
+      model = Sketchup.active_model
+      selected_page = model && model.pages ? model.pages.selected_page : nil
+      info = {
+        instance_id: @instance_id,
+        pid: Process.pid,
+        host: '127.0.0.1',
+        port: @port,
+        protocol_version: INSTANCE_PROTOCOL_VERSION,
+        sketchup_version: Sketchup.version.to_s,
+        model_guid: model && model.respond_to?(:guid) ? model.guid.to_s : '',
+        model_title: model && model.respond_to?(:title) ? model.title.to_s : '',
+        model_path: model && model.respond_to?(:path) ? model.path.to_s : '',
+        selected_page: selected_page ? selected_page.name.to_s : ''
+      }
+      { success: true, result: JSON.generate(info) }
+    end
+
     def handle_tool_call(request)
       log "Handling tool call: #{request.inspect}"
       tool_name = request["params"]["name"]
@@ -604,6 +672,8 @@ module SU_MCP
         result = case tool_name
         when "ping"
           { success: true, result: "pong" }
+        when "get_instance_info"
+          get_instance_info
         when "create_component"
           create_component(args)
         when "delete_component"
