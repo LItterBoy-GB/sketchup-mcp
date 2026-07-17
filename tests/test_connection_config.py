@@ -13,6 +13,7 @@ class ConnectionConfigTests(unittest.TestCase):
         server.startup.clear_session_autostart_allowed()
         server._active_request_count = 0
         server._last_activity_monotonic = 0.0
+        server._idle_watchdog_started = False
 
     def test_default_connection_target_uses_default_port(self):
         self.assertEqual(server.get_sketchup_host(), "localhost")
@@ -27,8 +28,22 @@ class ConnectionConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SKETCHUP_MCP_PORT"):
                 server.get_sketchup_port()
 
-    def test_idle_timeout_defaults_to_positive_value(self):
-        self.assertEqual(server.get_idle_timeout_sec(), server.DEFAULT_IDLE_TIMEOUT_SEC)
+    def test_idle_timeout_is_disabled_by_default(self):
+        with patch.dict("os.environ", {"SKETCHUP_MCP_IDLE_TIMEOUT_SEC": ""}):
+            self.assertEqual(server.DEFAULT_IDLE_TIMEOUT_SEC, 0.0)
+            self.assertEqual(server.get_idle_timeout_sec(), 0.0)
+
+    def test_default_idle_timeout_does_not_start_watchdog(self):
+        server._idle_watchdog_started = False
+
+        with (
+            patch.dict("os.environ", {"SKETCHUP_MCP_IDLE_TIMEOUT_SEC": ""}),
+            patch("sketchup_mcp.server.threading.Thread") as thread,
+        ):
+            server.start_idle_watchdog()
+
+        thread.assert_not_called()
+        self.assertFalse(server._idle_watchdog_started)
 
     def test_idle_timeout_can_be_configured_or_disabled(self):
         with patch.dict("os.environ", {"SKETCHUP_MCP_IDLE_TIMEOUT_SEC": "120"}):

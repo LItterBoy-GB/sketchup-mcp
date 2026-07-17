@@ -91,14 +91,14 @@ SKETCHUP_MCP_AUTOSTART = "1"
 SKETCHUP_MCP_SKETCHUP_EXE = "C:\\Program Files\\SketchUp\\SketchUp 2026\\SketchUp.exe"
 SKETCHUP_MCP_STARTUP_TIMEOUT = "45"
 SKETCHUP_MCP_REQUEST_TIMEOUT_MS = "15000"
-SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "3600"
+SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "0"
 ```
 
 自动启动只会在用户已批准后生效：要么通过当前 MCP 进程中的 `allow_sketchup_autostart` 批准，要么通过 `SKETCHUP_MCP_AUTOSTART=1` 预先批准。工具显式传入 `port` 时，只会尝试启动该端口对应的 SketchUp，绝不会回退到其他端口。
 
 每个 Python 到 SketchUp 的请求都会包含发送时间戳和 `SKETCHUP_MCP_REQUEST_TIMEOUT_MS`。如果 SketchUp 正忙，直到超时后才处理 socket，请求会被 Ruby 扩展丢弃，不会继续执行过期命令。
 
-`SKETCHUP_MCP_IDLE_TIMEOUT_SEC` 控制空闲 stdio MCP 进程在最后一次 SketchUp 命令后可以存活多久。设置为 `0` 可以关闭空闲 watchdog。
+`SKETCHUP_MCP_IDLE_TIMEOUT_SEC` 控制空闲 stdio MCP 进程在最后一次 SketchUp 命令后可以存活多久。默认值为 `0`，即保持 bridge 常驻并关闭空闲 watchdog。只有当 MCP host 能自动重启过期 bridge 时才应设置正数；否则 watchdog 退出进程后，host 可能提示 `Transport closed`。
 
 `SKETCHUP_MCP_PORT` 只定义默认目标端口。一个 MCP server 已可按每次工具调用的显式 `port` 路由到不同的本机 SketchUp，因此日常多实例操作不再需要为每个端口额外配置 MCP server。
 

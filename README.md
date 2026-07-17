@@ -98,7 +98,7 @@ SKETCHUP_MCP_AUTOSTART = "1"
 SKETCHUP_MCP_SKETCHUP_EXE = "C:\\Program Files\\SketchUp\\SketchUp 2026\\SketchUp.exe"
 SKETCHUP_MCP_STARTUP_TIMEOUT = "45"
 SKETCHUP_MCP_REQUEST_TIMEOUT_MS = "15000"
-SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "3600"
+SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "0"
 ```
 
 Autostart runs only after the user has approved it, either through
@@ -112,8 +112,10 @@ socket after that timeout has elapsed, the Ruby extension drops the stale
 request without executing it.
 
 `SKETCHUP_MCP_IDLE_TIMEOUT_SEC` controls how long an unused stdio MCP process
-can stay alive after its last Sketchup command. Set it to `0` to disable the
-idle watchdog.
+can stay alive after its last SketchUp command. It defaults to `0`, which keeps
+the bridge alive and disables the idle watchdog. Set a positive value only when
+the MCP host is expected to restart an expired bridge; otherwise the host may
+report `Transport closed` when the watchdog exits the process.
 
 `SKETCHUP_MCP_PORT` is only the default target. One MCP entry can route each
 tool call to any explicitly supplied local SketchUp port, so extra MCP entries
