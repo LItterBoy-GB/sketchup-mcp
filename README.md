@@ -64,13 +64,97 @@ uvx --from . sketchup-mcp-cli --help
 
 ## MCP Client Configuration
 
-SketchupMCP is a stdio MCP server. The Python process is started by your MCP
-client, then it connects to the Sketchup Ruby extension over local TCP.
+SketchupMCP supports both a shared Streamable HTTP service and the original
+stdio server. Both transports connect to the SketchUp Ruby extension over local
+TCP. For Codex, prefer the shared HTTP service described below.
 
-### Codex
+### Recommended: shared Streamable HTTP service for Codex
+
+A stdio MCP process owns one host session's input/output pipe. Multiple Codex
+tasks cannot share the same stdio process, so a task-per-stdio configuration can
+create duplicate SketchUp MCP Python processes. Use the long-running Streamable
+HTTP service at `http://127.0.0.1:8765/mcp` when several Codex tasks need the
+same local SketchUp MCP bridge.
+
+Keep the bearer token in the user-scoped environment variable
+`SKETCHUP_MCP_HTTP_TOKEN`; never put the token itself in `config.toml`. The
+login scheduled task and the HTTP daemon lifecycle are managed by
+`scripts/manage-http-daemon.ps1`.
+
+#### Windows daemon management
+
+Run these commands from the repository root in PowerShell. `Install` creates
+or updates the current user's logon scheduled task and starts the daemon; its
+default is `-AllowAutostart:$true`.
+
+```powershell
+.\scripts\manage-http-daemon.ps1 Install
+.\scripts\manage-http-daemon.ps1 Status
+.\scripts\manage-http-daemon.ps1 Restart
+.\scripts\manage-http-daemon.ps1 RotateToken
+.\scripts\manage-http-daemon.ps1 Uninstall
+.\scripts\manage-http-daemon.ps1 Uninstall -RemoveToken
+```
+
+With the default `Install`, any local client that holds a valid bearer token
+can trigger SketchUp autostart through the HTTP service. Disable that
+pre-approval when this is not acceptable:
+
+```powershell
+.\scripts\manage-http-daemon.ps1 Install -AllowAutostart:$false
+```
+
+`RotateToken` replaces the user-scoped bearer token and restarts the daemon.
+The scheduled-task runner reloads the current user-scoped token on every start,
+so it does not reuse the task engine's older process environment.
+Restart Codex afterwards so it reads the replacement token. The daemon log is
+`%LOCALAPPDATA%\SketchUpMCP\logs\http-daemon.log`, rotated at 5 MiB with five
+retained files. Session state is removed immediately after a normal HTTP
+`DELETE` close; an unexpectedly disconnected session is reclaimed after 1800
+seconds of inactivity.
 
 Codex reads MCP servers from `~/.codex/config.toml`, or from a project-scoped
-`.codex/config.toml` when the project is trusted.
+`.codex/config.toml` when the project is trusted. Add the HTTP entry (or first
+add it under a temporary name during migration):
+
+```toml
+[mcp_servers.sketchup_2022]
+url = "http://127.0.0.1:8765/mcp"
+bearer_token_env_var = "SKETCHUP_MCP_HTTP_TOKEN"
+startup_timeout_sec = 20
+tool_timeout_sec = 300
+required = false
+
+[mcp_servers.sketchup_2022.tools.eval_ruby]
+approval_mode = "approve"
+```
+
+Restart Codex after changing its MCP configuration or the user environment. For
+a safe migration, first use a temporary HTTP server name and verify it, then
+switch the normal entry to HTTP. Only after that verification, clean up the old
+stdio process tree whose executable and launch arguments exactly match the old
+configuration. Do not terminate the shared HTTP daemon or unrelated MCP
+processes.
+
+To roll back in the safe order, restore the stdio configuration and restart
+Codex first, then run `Uninstall` to remove the resident scheduled task. Keep
+the token unless it must be removed; only then run `Uninstall -RemoveToken`.
+
+HTTP keeps state isolated per MCP session. Target-port selection is resolved in
+this order: an explicit tool `port`, then that session's default set through
+`set_connection_port`, then the service default port `9876`. Calls to the same
+resolved port are serialized; calls to different ports can run in parallel.
+The HTTP service does not use an idle watchdog.
+
+This change addresses duplicate **SketchUp MCP** processes only. It does not
+start, stop, share, or deduplicate other MCP services such as Chrome, IDA, or
+PPT.
+
+### Legacy stdio: compatibility and rollback
+
+The original stdio transport remains available for compatibility and rollback.
+It starts one Python process per MCP host session, so do not attempt to share a
+single stdio instance across multiple Codex tasks.
 
 ```toml
 [mcp_servers.sketchup]
@@ -83,10 +167,10 @@ tool_timeout_sec = 300
 SKETCHUP_MCP_PORT = "9876"
 ```
 
-By default, the MCP server will not open Sketchup on its own. If the Ruby port
-is not reachable, the tool response tells the agent to ask the user whether it
-may start Sketchup. After the user agrees, call `allow_sketchup_autostart`, then
-retry the Sketchup tool call.
+By default, the legacy stdio server will not open Sketchup on its own. If the
+Ruby port is not reachable, the tool response tells the agent to ask the user whether it may start Sketchup.
+After the user agrees, call `allow_sketchup_autostart`, then retry the Sketchup
+tool call.
 
 To pre-approve Sketchup startup for this MCP server, add the autostart
 environment variables:
@@ -111,11 +195,10 @@ Every Python-to-Sketchup request includes a send timestamp and
 socket after that timeout has elapsed, the Ruby extension drops the stale
 request without executing it.
 
-`SKETCHUP_MCP_IDLE_TIMEOUT_SEC` controls how long an unused stdio MCP process
-can stay alive after its last SketchUp command. It defaults to `0`, which keeps
-the bridge alive and disables the idle watchdog. Set a positive value only when
-the MCP host is expected to restart an expired bridge; otherwise the host may
-report `Transport closed` when the watchdog exits the process.
+`SKETCHUP_MCP_IDLE_TIMEOUT_SEC` applies only to the legacy stdio process. It
+controls how long that unused process can stay alive after its last SketchUp
+command. It defaults to `0`, which keeps the bridge alive and disables the idle
+watchdog. The shared HTTP service does not use this watchdog.
 
 `SKETCHUP_MCP_PORT` is only the default target. One MCP entry can route each
 tool call to any explicitly supplied local SketchUp port, so extra MCP entries
@@ -153,15 +236,16 @@ that targets that window.
 
 ### Starting the Connection
 
-1. In Sketchup, go to Extensions > MCP Server > Start Server
-2. The server will start on the default port (9876)
-3. Start Codex, opencode, or another configured MCP client
+1. Load the extension in SketchUp. The Ruby listener starts automatically.
+2. It tries port `9876`, then increments until it can bind an available port.
+3. Use Extensions > MCP Server > Current Port to see the selected port.
+4. Start Codex, opencode, or another configured MCP client.
 
 Use the Sketchup `Extensions > MCP Server` menu as the local server control
-panel. `Start Server` starts the Ruby-side TCP listener, `Stop Server` pauses
-it, `Current Port` shows the active listener port, and `Set Port...` changes
-the port before starting a server. Assign each Sketchup instance a different
-port when several models must be controlled at once.
+panel. `Start Server` starts the Ruby-side TCP listener again after it has been
+stopped, `Stop Server` pauses it, `Current Port` shows the active listener port,
+and `Set Port...` changes the port before a manual start. Assign each Sketchup
+instance a different port when several models must be controlled at once.
 
 ![MCP Server menu showing current port, set port, start, and stop controls](docs/images/mcp-server-menu.png)
 
@@ -170,11 +254,12 @@ port when several models must be controlled at once.
 Each Sketchup instance runs its own local TCP server. To connect multiple
 instances at the same time, give each Sketchup instance a different port:
 
-1. In Sketchup, go to Extensions > MCP Server > Set Port...
-2. Enter a port such as `9876`, `9877`, or `9878`
-3. Use the Current Port menu item to confirm the active port
-4. Start the server from Extensions > MCP Server > Start Server
-5. In the MCP conversation, call `list_sketchup_instances` to confirm the
+1. Load the extension in each SketchUp instance. Each listener automatically
+   selects the first available port starting at `9876`.
+2. Use the Current Port menu item to confirm each active port.
+3. To choose a port manually, stop the server, use Extensions > MCP Server >
+   Set Port..., then use Extensions > MCP Server > Start Server.
+4. In the MCP conversation, call `list_sketchup_instances` to confirm the
    running windows, or use the known port directly.
 
 Every SketchUp tool accepts an optional `port`. For example, use

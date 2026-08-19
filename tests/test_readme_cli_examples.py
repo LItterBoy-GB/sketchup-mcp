@@ -31,6 +31,15 @@ class ReadmeCliExamplesTests(unittest.TestCase):
         self.assertNotIn("Extensions > SketchupMCP", readme)
         self.assertIn("Extensions > MCP Server > Start Server", readme)
 
+    def test_ruby_listener_autostart_and_port_search_are_documented(self):
+        readme = Path("README.md").read_text(encoding="utf-8")
+        chinese_readme = Path("README.zh-CN.md").read_text(encoding="utf-8")
+
+        self.assertIn("listener starts automatically", readme)
+        self.assertIn("first available port starting at `9876`", readme)
+        self.assertIn("listener 会自动启动", chinese_readme)
+        self.assertIn("从 `9876` 开始", chinese_readme)
+
     def test_codex_and_opencode_mcp_config_are_documented(self):
         readme = Path("README.md").read_text(encoding="utf-8")
 
@@ -38,6 +47,105 @@ class ReadmeCliExamplesTests(unittest.TestCase):
         self.assertIn("`opencode.json`", readme)
         self.assertIn('"type": "local"', readme)
         self.assertIn('"command": ["uvx", "sketchup-mcp"]', readme)
+
+    def test_shared_http_codex_configuration_and_migration_are_documented(self):
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn("http://127.0.0.1:8765/mcp", readme)
+        self.assertIn("SKETCHUP_MCP_HTTP_TOKEN", readme)
+        self.assertIn("scripts/manage-http-daemon.ps1", readme)
+        self.assertIn('[mcp_servers.sketchup_2022]', readme)
+        self.assertIn('url = "http://127.0.0.1:8765/mcp"', readme)
+        self.assertIn('bearer_token_env_var = "SKETCHUP_MCP_HTTP_TOKEN"', readme)
+        self.assertIn("startup_timeout_sec = 20", readme)
+        self.assertIn("tool_timeout_sec = 300", readme)
+        self.assertIn("required = false", readme)
+        self.assertIn("[mcp_servers.sketchup_2022.tools.eval_ruby]", readme)
+        self.assertIn('approval_mode = "approve"', readme)
+        self.assertIn("Multiple Codex\ntasks cannot share the same stdio process", readme)
+        self.assertIn("explicit tool `port`, then that session's default", readme)
+        self.assertIn("service default port `9876`", readme)
+        self.assertIn("Calls to the same\nresolved port are serialized", readme)
+        self.assertIn("does not use an idle watchdog", readme)
+        self.assertIn("Restart Codex", readme)
+        self.assertIn("temporary HTTP server name", readme)
+        self.assertIn("exactly match the old\nconfiguration", readme)
+        self.assertIn("Chrome, IDA, or\nPPT", readme)
+        self.assertRegex(
+            readme,
+            re.compile(
+                r"```toml\n"
+                r"\[mcp_servers\.sketchup_2022\]\n"
+                r"url = \"http://127\.0\.0\.1:8765/mcp\"\n"
+                r"bearer_token_env_var = \"SKETCHUP_MCP_HTTP_TOKEN\"\n"
+                r"startup_timeout_sec = 20\n"
+                r"tool_timeout_sec = 300\n"
+                r"required = false\n\n"
+                r"\[mcp_servers\.sketchup_2022\.tools\.eval_ruby\]\n"
+                r"approval_mode = \"approve\"\n```"
+            ),
+        )
+
+    def test_chinese_readme_documents_shared_http_contract(self):
+        readme = Path("README.zh-CN.md").read_text(encoding="utf-8")
+
+        self.assertIn("http://127.0.0.1:8765/mcp", readme)
+        self.assertIn("SKETCHUP_MCP_HTTP_TOKEN", readme)
+        self.assertIn("scripts/manage-http-daemon.ps1", readme)
+        self.assertIn("多个 Codex 任务不能共享同一个 stdio 进程", readme)
+        self.assertIn("显式传入的 `port` >", readme)
+        self.assertIn("服务默认端口 `9876`", readme)
+        self.assertIn("相同解析端口的调用会串行执行；不同端口的调用可以并行执行", readme)
+        self.assertIn("HTTP 服务不使用 idle watchdog", readme)
+        self.assertIn("必须重启 Codex", readme)
+        self.assertIn("临时 HTTP server 名称", readme)
+        self.assertIn("精确匹配的 stdio 进程树", readme)
+        self.assertIn("Chrome、IDA、PPT", readme)
+        self.assertIn("兼容与回滚", readme)
+        self.assertRegex(
+            readme,
+            re.compile(
+                r"```toml\n"
+                r"\[mcp_servers\.sketchup_2022\]\n"
+                r"url = \"http://127\.0\.0\.1:8765/mcp\"\n"
+                r"bearer_token_env_var = \"SKETCHUP_MCP_HTTP_TOKEN\"\n"
+                r"startup_timeout_sec = 20\n"
+                r"tool_timeout_sec = 300\n"
+                r"required = false\n\n"
+                r"\[mcp_servers\.sketchup_2022\.tools\.eval_ruby\]\n"
+                r"approval_mode = \"approve\"\n```"
+            ),
+        )
+
+    def test_shared_http_daemon_lifecycle_is_documented_in_both_languages(self):
+        english = Path("README.md").read_text(encoding="utf-8")
+        chinese = Path("README.zh-CN.md").read_text(encoding="utf-8")
+
+        for readme in (english, chinese):
+            for command in (
+                ".\\scripts\\manage-http-daemon.ps1 Install",
+                ".\\scripts\\manage-http-daemon.ps1 Status",
+                ".\\scripts\\manage-http-daemon.ps1 Restart",
+                ".\\scripts\\manage-http-daemon.ps1 RotateToken",
+                ".\\scripts\\manage-http-daemon.ps1 Uninstall",
+                ".\\scripts\\manage-http-daemon.ps1 Uninstall -RemoveToken",
+                ".\\scripts\\manage-http-daemon.ps1 Install -AllowAutostart:$false",
+            ):
+                self.assertIn(command, readme)
+            self.assertIn("-AllowAutostart:$true", readme)
+            self.assertIn("%LOCALAPPDATA%\\SketchUpMCP\\logs\\http-daemon.log", readme)
+            self.assertIn("5 MiB", readme)
+            self.assertIn("1800", readme)
+            self.assertIn("Uninstall -RemoveToken", readme)
+
+        self.assertIn("valid bearer token\ncan trigger SketchUp autostart", english)
+        self.assertIn("reloads the current user-scoped token on every start", english)
+        self.assertIn("Restart Codex afterwards", english)
+        self.assertIn("normal HTTP\n`DELETE` close", english)
+        self.assertIn("恢复 stdio 配置并重启 Codex", chinese)
+        self.assertIn("每次启动时重新读取当前用户级 Token", chinese)
+        self.assertIn("必须重启 Codex", chinese)
+        self.assertIn("正常通过 `DELETE` 关闭后立即清理状态", chinese)
 
     def test_local_development_commands_cover_activation_and_uvx(self):
         readme = Path("README.md").read_text(encoding="utf-8")

@@ -129,14 +129,14 @@ module SU_MCP
       was_running ? start : true
     end
 
-    def start
+    def start(server_socket = nil)
       return true if @running
       
       begin
         log "Starting server on localhost:#{@port}..."
         initialize_eval_ruby_log
         
-        @server = TCPServer.new('127.0.0.1', @port)
+        @server = server_socket || TCPServer.new('127.0.0.1', @port)
         log "Server created on port #{@port}"
         write_instance_registry
         
@@ -229,6 +229,39 @@ module SU_MCP
       end
     end
 
+    def start_on_available_port(start_port = DEFAULT_PORT)
+      return true if @running
+
+      first_port = parse_port(start_port)
+      unless first_port
+        log "Automatic start port must be an integer from 1 to 65535."
+        return false
+      end
+
+      original_port = @port
+      server_socket, selected_port = bind_available_server(first_port)
+      unless server_socket
+        log "No available MCP port found from #{first_port} through 65535."
+        return false
+      end
+
+      @port = selected_port
+      update_port_menu_text
+      unless start(server_socket)
+        @port = original_port
+        update_port_menu_text
+        return false
+      end
+
+      begin
+        Sketchup.write_default(SETTINGS_NAMESPACE, SETTINGS_PORT_KEY, @port)
+      rescue StandardError => e
+        log "Failed to save automatically selected port #{@port}: #{e.message}"
+      end
+      log "Automatically started MCP server on port #{@port}"
+      true
+    end
+
     def stop
       log "Stopping server..."
       @running = false
@@ -252,6 +285,18 @@ module SU_MCP
 
       port = text.to_i
       self.class.valid_port?(port) ? port : nil
+    end
+
+    def bind_available_server(start_port)
+      (start_port..65_535).each do |candidate_port|
+        begin
+          return [TCPServer.new('127.0.0.1', candidate_port), candidate_port]
+        rescue Errno::EADDRINUSE, Errno::EACCES => e
+          log "MCP port #{candidate_port} is unavailable: #{e.message}"
+        end
+      end
+
+      [nil, nil]
     end
 
     def instance_registry_dir
@@ -2463,5 +2508,12 @@ module SU_MCP
     menu.add_item("Stop Server") { @server.stop }
     
     file_loaded(__FILE__)
+
+    # 等待 SketchUp UI 循环就绪后自动启动，并保留成功绑定的 socket，避免端口探测竞争。
+    UI.start_timer(0, false) do
+      unless @server.start_on_available_port(Server::DEFAULT_PORT)
+        @server.log "Automatic MCP server startup failed"
+      end
+    end
   end
 end 

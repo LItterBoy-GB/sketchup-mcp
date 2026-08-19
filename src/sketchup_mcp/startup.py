@@ -2,8 +2,10 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import weakref
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 AUTOSTART_ENV = "SKETCHUP_MCP_AUTOSTART"
@@ -11,7 +13,12 @@ SKETCHUP_EXE_ENV = "SKETCHUP_MCP_SKETCHUP_EXE"
 STARTUP_TIMEOUT_ENV = "SKETCHUP_MCP_STARTUP_TIMEOUT"
 DEFAULT_STARTUP_TIMEOUT = 45.0
 
-_session_autostart_allowed = False
+# Direct library callers from older releases did not have an MCP session. Keep a
+# narrow compatibility fallback for those callers only; MCP tool requests pass
+# their actual ctx.session and never share this value.
+_legacy_session_autostart_allowed = False
+_session_autostart_allowed: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
+_session_autostart_lock = threading.RLock()
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -22,17 +29,48 @@ def autostart_enabled() -> bool:
     return _truthy(os.environ.get(AUTOSTART_ENV))
 
 
-def set_session_autostart_allowed(allowed: bool) -> None:
-    global _session_autostart_allowed
-    _session_autostart_allowed = bool(allowed)
+def set_session_autostart_allowed(allowed: bool, session: Any = None) -> None:
+    """Record temporary autostart consent for one MCP session.
+
+    ``session=None`` preserves the old direct-call behavior. Real MCP requests
+    always provide ``ctx.session``, which makes the consent independent for
+    every stdio or Streamable HTTP session and lets weak references reclaim it.
+    """
+    global _legacy_session_autostart_allowed
+    if session is None:
+        _legacy_session_autostart_allowed = bool(allowed)
+        return
+
+    with _session_autostart_lock:
+        try:
+            _session_autostart_allowed[session] = bool(allowed)
+        except TypeError:
+            # A non-weak-referenceable session is not a valid MCP transport
+            # session. Do not silently promote its consent to process scope.
+            raise ValueError("MCP session does not support isolated autostart state")
 
 
-def clear_session_autostart_allowed() -> None:
-    set_session_autostart_allowed(False)
+def clear_session_autostart_allowed(session: Any = None) -> None:
+    """Clear one session's temporary consent, or the legacy fallback."""
+    global _legacy_session_autostart_allowed
+    if session is None:
+        _legacy_session_autostart_allowed = False
+        return
+
+    with _session_autostart_lock:
+        _session_autostart_allowed.pop(session, None)
 
 
-def autostart_allowed() -> bool:
-    return autostart_enabled() or _session_autostart_allowed
+def autostart_allowed(session: Any = None, *, service_preapproved: bool = False) -> bool:
+    """Return effective autostart permission without leaking session consent."""
+    if autostart_enabled() or service_preapproved:
+        return True
+
+    if session is None:
+        return _legacy_session_autostart_allowed
+
+    with _session_autostart_lock:
+        return bool(_session_autostart_allowed.get(session, False))
 
 
 def get_startup_timeout() -> float:
@@ -50,11 +88,22 @@ def get_startup_timeout() -> float:
     return timeout
 
 
-def maybe_start_sketchup(port: int) -> bool:
-    if not autostart_allowed():
+def maybe_start_sketchup(
+    port: int,
+    *,
+    session: Any = None,
+    service_preapproved: bool = False,
+    sketchup_exe: Optional[str] = None,
+) -> bool:
+    if not autostart_allowed(session, service_preapproved=service_preapproved):
         return False
 
-    launch_sketchup(port)
+    # Keep the legacy call shape when no launch override is in effect. Older
+    # embedding code and tests patch ``launch_sketchup(port)`` directly.
+    if sketchup_exe is None:
+        launch_sketchup(port)
+    else:
+        launch_sketchup(port, sketchup_exe=sketchup_exe)
     return True
 
 

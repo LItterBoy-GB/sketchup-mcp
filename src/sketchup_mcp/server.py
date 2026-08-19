@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from contextlib import asynccontextmanager, contextmanager
@@ -33,6 +34,35 @@ DEFAULT_IDLE_TIMEOUT_SEC = 0.0
 IDLE_TIMEOUT_ENV = "SKETCHUP_MCP_IDLE_TIMEOUT_SEC"
 CONTENT_LENGTH_PREFIX = b"Content-Length:"
 
+@dataclass
+class _ServiceDefaults:
+    """Process configuration shared by one launched MCP service.
+
+    These are launch-time defaults, not mutable client preferences. A tool's
+    ``set_connection_port`` and temporary autostart consent live in the
+    corresponding MCP session below.
+    """
+
+    sketchup_port: Optional[int] = None
+    allow_autostart: bool = False
+    sketchup_executable: Optional[str] = None
+    startup_timeout: Optional[float] = None
+    request_timeout_ms: Optional[int] = None
+
+
+@dataclass
+class _SessionState:
+    sketchup_port: Optional[int] = None
+
+
+_service_defaults = _ServiceDefaults()
+_service_defaults_lock = threading.RLock()
+_session_states: "weakref.WeakKeyDictionary[Any, _SessionState]" = weakref.WeakKeyDictionary()
+_session_states_lock = threading.RLock()
+
+# Kept only for direct callers of the old public helper API. MCP tools use
+# ctx.session state and never read or write this process-wide compatibility
+# value.
 _sketchup_port_override: Optional[int] = None
 _port_override_lock = threading.RLock()
 _port_locks: Dict[Tuple[str, int], threading.RLock] = {}
@@ -133,6 +163,10 @@ class SketchupConnection:
     host: str
     port: int
     sock: socket.socket = None
+    session: Any = None
+    service_preapproved_autostart: bool = False
+    sketchup_executable: Optional[str] = None
+    startup_timeout: Optional[float] = None
     
     def connect(self, allow_autostart: bool = True) -> bool:
         """Connect to the Sketchup extension socket server"""
@@ -150,12 +184,26 @@ class SketchupConnection:
         if self._connect_once():
             return True
 
-        if allow_autostart and startup.maybe_start_sketchup(self.port):
+        autostart_started = False
+        if allow_autostart:
+            if self.session is None and not self.service_preapproved_autostart and self.sketchup_executable is None:
+                autostart_started = startup.maybe_start_sketchup(self.port)
+            else:
+                autostart_started = startup.maybe_start_sketchup(
+                    self.port,
+                    session=self.session,
+                    service_preapproved=self.service_preapproved_autostart,
+                    sketchup_exe=self.sketchup_executable,
+                )
+
+        if allow_autostart and autostart_started:
             logger.info("Sketchup autostart requested; waiting for port %s", self.port)
             if self._connect_once():
                 return True
 
-            startup_timeout = startup.get_startup_timeout()
+            startup_timeout = self.startup_timeout
+            if startup_timeout is None:
+                startup_timeout = startup.get_startup_timeout()
             if startup_timeout <= 0:
                 return False
 
@@ -395,14 +443,99 @@ def get_sketchup_host() -> str:
     return DEFAULT_SKETCHUP_HOST
 
 
-def get_sketchup_port(port: Any = None) -> int:
-    """Resolve an explicit request port before session and environment defaults."""
+def configure_service_defaults(
+    *,
+    sketchup_port: Any = None,
+    allow_autostart: bool = False,
+    sketchup_executable: Optional[str] = None,
+    startup_timeout: Optional[float] = None,
+    request_timeout_ms: Optional[int] = None,
+) -> None:
+    """Configure launch-time defaults for one MCP service instance."""
+    parsed_port = None if sketchup_port is None else _parse_sketchup_port(sketchup_port, "sketchup_port")
+    if startup_timeout is not None and startup_timeout <= 0:
+        raise ValueError("startup_timeout must be a positive number")
+    if request_timeout_ms is not None and request_timeout_ms <= 0:
+        raise ValueError("request_timeout_ms must be a positive integer")
+
+    with _service_defaults_lock:
+        _service_defaults.sketchup_port = parsed_port
+        _service_defaults.allow_autostart = bool(allow_autostart)
+        _service_defaults.sketchup_executable = sketchup_executable
+        _service_defaults.startup_timeout = startup_timeout
+        _service_defaults.request_timeout_ms = request_timeout_ms
+
+
+def reset_service_defaults() -> None:
+    """Reset launch-time defaults; intended for isolated test processes."""
+    configure_service_defaults()
+
+
+def _service_defaults_snapshot() -> _ServiceDefaults:
+    with _service_defaults_lock:
+        return _ServiceDefaults(
+            sketchup_port=_service_defaults.sketchup_port,
+            allow_autostart=_service_defaults.allow_autostart,
+            sketchup_executable=_service_defaults.sketchup_executable,
+            startup_timeout=_service_defaults.startup_timeout,
+            request_timeout_ms=_service_defaults.request_timeout_ms,
+        )
+
+
+def _session_from_context(ctx: Any) -> Any:
+    if ctx is None:
+        return None
+    try:
+        return ctx.session
+    except (AttributeError, ValueError):
+        return None
+
+
+def _session_state(ctx: Any, *, create: bool = False) -> Optional[_SessionState]:
+    session = _session_from_context(ctx)
+    if session is None:
+        return None
+    with _session_states_lock:
+        try:
+            state = _session_states.get(session)
+            if state is None and create:
+                state = _SessionState()
+                _session_states[session] = state
+            return state
+        except TypeError:
+            # Never make an unrecognised context process-global. The real MCP
+            # ServerSession is weak-referenceable; simple fake contexts retain
+            # the historical direct-call behavior in tests and integrations.
+            return None
+
+
+def clear_session_state(ctx: Any) -> None:
+    """Remove state for a terminated MCP session when explicit cleanup is needed."""
+    session = _session_from_context(ctx)
+    if session is not None:
+        with _session_states_lock:
+            _session_states.pop(session, None)
+        startup.clear_session_autostart_allowed(session)
+
+
+def get_sketchup_port(port: Any = None, *, ctx: Any = None) -> int:
+    """Resolve explicit port, then current MCP session, then service/environment."""
     if port is not None:
         return _parse_sketchup_port(port, "port")
 
-    with _port_override_lock:
-        if _sketchup_port_override is not None:
-            return _sketchup_port_override
+    state = _session_state(ctx)
+    if state is not None and state.sketchup_port is not None:
+        return state.sketchup_port
+
+    defaults = _service_defaults_snapshot()
+    if defaults.sketchup_port is not None:
+        return defaults.sketchup_port
+
+    # Compatibility for callers that pre-date Context-based MCP sessions.
+    if _session_from_context(ctx) is None:
+        with _port_override_lock:
+            if _sketchup_port_override is not None:
+                return _sketchup_port_override
 
     raw_port = os.environ.get(SKETCHUP_PORT_ENV)
     if raw_port is None or raw_port.strip() == "":
@@ -410,7 +543,11 @@ def get_sketchup_port(port: Any = None) -> int:
 
     return _parse_sketchup_port(raw_port, SKETCHUP_PORT_ENV)
 
-def get_request_timeout_ms() -> int:
+def get_request_timeout_ms(*, ctx: Any = None) -> int:
+    defaults = _service_defaults_snapshot()
+    if defaults.request_timeout_ms is not None:
+        return defaults.request_timeout_ms
+
     raw_timeout = os.environ.get(REQUEST_TIMEOUT_ENV)
     if raw_timeout is None or raw_timeout.strip() == "":
         return DEFAULT_REQUEST_TIMEOUT_MS
@@ -448,10 +585,16 @@ def _parse_sketchup_port(value: Any, source: str) -> int:
         raise ValueError(f"{source} must be an integer from 1 to 65535")
     return port
 
-def set_sketchup_port_override(port: Any) -> int:
+def set_sketchup_port_override(port: Any, *, ctx: Any = None) -> int:
     global _sketchup_port_override
 
     parsed_port = _parse_sketchup_port(port, "port")
+
+    state = _session_state(ctx, create=True)
+    if state is not None:
+        state.sketchup_port = parsed_port
+        return parsed_port
+
     with _port_override_lock:
         _sketchup_port_override = parsed_port
     return parsed_port
@@ -473,9 +616,17 @@ def _connection_lock(host: str, port: int) -> threading.RLock:
         return lock
 
 
-def _connection_error(host: str, port: int, *, allow_autostart: bool) -> ConnectionError:
+def _autostart_allowed_for_context(ctx: Any = None) -> bool:
+    defaults = _service_defaults_snapshot()
+    return startup.autostart_allowed(
+        _session_from_context(ctx),
+        service_preapproved=defaults.allow_autostart,
+    )
+
+
+def _connection_error(host: str, port: int, *, allow_autostart: bool, ctx: Any = None) -> ConnectionError:
     permission_hint = ""
-    if allow_autostart and not startup.autostart_allowed():
+    if allow_autostart and not _autostart_allowed_for_context(ctx):
         permission_hint = (
             " Ask the user whether to start SketchUp. If the user agrees, call "
             "`allow_sketchup_autostart` and retry the SketchUp tool call."
@@ -486,14 +637,27 @@ def _connection_error(host: str, port: int, *, allow_autostart: bool) -> Connect
     )
 
 
-def get_sketchup_connection(allow_autostart: bool = True, port: Any = None) -> SketchupConnection:
+def _new_connection(host: str, port: int, *, ctx: Any = None) -> SketchupConnection:
+    """Instantiate through the long-standing two-argument constructor shape."""
+    connection = SketchupConnection(host=host, port=port)
+    defaults = _service_defaults_snapshot()
+    # Assign settings after construction so integrations that substitute the
+    # historical ``SketchupConnection(host, port)`` test double keep working.
+    connection.session = _session_from_context(ctx)
+    connection.service_preapproved_autostart = defaults.allow_autostart
+    connection.sketchup_executable = defaults.sketchup_executable
+    connection.startup_timeout = defaults.startup_timeout
+    return connection
+
+
+def get_sketchup_connection(allow_autostart: bool = True, port: Any = None, *, ctx: Any = None) -> SketchupConnection:
     """Create a non-cached connection for compatibility with direct callers."""
     host = get_sketchup_host()
-    target_port = get_sketchup_port(port)
-    connection = SketchupConnection(host=host, port=target_port)
+    target_port = get_sketchup_port(port, ctx=ctx)
+    connection = _new_connection(host, target_port, ctx=ctx)
     if not connection.connect(allow_autostart=allow_autostart):
         connection.disconnect()
-        raise _connection_error(host, target_port, allow_autostart=allow_autostart)
+        raise _connection_error(host, target_port, allow_autostart=allow_autostart, ctx=ctx)
     return connection
 
 
@@ -502,17 +666,18 @@ def _request_connection(
     port: Any = None,
     *,
     allow_autostart: bool = True,
+    ctx: Any = None,
 ) -> Iterator[Tuple[SketchupConnection, Dict[str, Any]]]:
     """Open exactly one serialized Ruby TCP connection for a resolved target."""
     host = get_sketchup_host()
-    target_port = get_sketchup_port(port)
+    target_port = get_sketchup_port(port, ctx=ctx)
     target = {"host": host, "port": target_port}
 
     with _connection_lock(host, target_port):
-        connection = SketchupConnection(host=host, port=target_port)
+        connection = _new_connection(host, target_port, ctx=ctx)
         if not connection.connect(allow_autostart=allow_autostart):
             connection.disconnect()
-            raise _connection_error(host, target_port, allow_autostart=allow_autostart)
+            raise _connection_error(host, target_port, allow_autostart=allow_autostart, ctx=ctx)
         try:
             yield connection, target
         finally:
@@ -528,14 +693,16 @@ def _send_ruby_tool_sync(
     allow_autostart: bool = True,
     request_timeout_ms: Optional[int] = None,
     max_retries: int = 2,
+    ctx: Any = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    with _request_connection(port, allow_autostart=allow_autostart) as (connection, target):
+    effective_timeout_ms = get_request_timeout_ms(ctx=ctx) if request_timeout_ms is None else request_timeout_ms
+    with _request_connection(port, allow_autostart=allow_autostart, ctx=ctx) as (connection, target):
         result = connection.send_command(
             method="tools/call",
             params={"name": name, "arguments": arguments},
             request_id=request_id,
             allow_autostart=allow_autostart,
-            request_timeout_ms=request_timeout_ms,
+            request_timeout_ms=effective_timeout_ms,
             max_retries=max_retries,
         )
     return result, target
@@ -550,6 +717,7 @@ async def _send_ruby_tool(
     allow_autostart: bool = True,
     request_timeout_ms: Optional[int] = None,
     max_retries: int = 2,
+    ctx: Any = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return await asyncio.to_thread(
         _send_ruby_tool_sync,
@@ -560,13 +728,38 @@ async def _send_ruby_tool(
         allow_autostart=allow_autostart,
         request_timeout_ms=request_timeout_ms,
         max_retries=max_retries,
+        ctx=ctx,
     )
 
 
-def _tool_error(exc: BaseException, port: Any = None) -> str:
+async def _send_ruby_tool_for_context(
+    ctx: Any,
+    name: str,
+    arguments: Dict[str, Any],
+    request_id: Any,
+    *,
+    port: Any = None,
+    allow_autostart: bool = True,
+    request_timeout_ms: Optional[int] = None,
+    max_retries: int = 2,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Pass state only for an actual MCP Context, retaining direct-call ABI."""
+    kwargs: Dict[str, Any] = {"port": port}
+    if allow_autostart is not True:
+        kwargs["allow_autostart"] = allow_autostart
+    if request_timeout_ms is not None:
+        kwargs["request_timeout_ms"] = request_timeout_ms
+    if max_retries != 2:
+        kwargs["max_retries"] = max_retries
+    if _session_from_context(ctx) is not None:
+        kwargs["ctx"] = ctx
+    return await _send_ruby_tool(name, arguments, request_id, **kwargs)
+
+
+def _tool_error(exc: BaseException, port: Any = None, *, ctx: Any = None) -> str:
     payload: Dict[str, Any] = {"success": False, "host": get_sketchup_host(), "error": str(exc)}
     try:
-        payload["port"] = get_sketchup_port(port)
+        payload["port"] = get_sketchup_port(port, ctx=ctx)
     except ValueError:
         payload["port"] = port
     return json.dumps(payload)
@@ -586,7 +779,7 @@ def _result_text(result: Dict[str, Any]) -> Any:
     return first["text"]
 
 
-def _get_instance_info_sync(port: Any = None) -> Dict[str, Any]:
+def _get_instance_info_sync(port: Any = None, *, ctx: Any = None) -> Dict[str, Any]:
     result, target = _send_ruby_tool_sync(
         "get_instance_info",
         {},
@@ -595,6 +788,7 @@ def _get_instance_info_sync(port: Any = None) -> Dict[str, Any]:
         allow_autostart=False,
         request_timeout_ms=DISCOVERY_REQUEST_TIMEOUT_MS,
         max_retries=0,
+        ctx=ctx,
     )
     raw_info = _result_text(result)
     info = json.loads(raw_info) if isinstance(raw_info, str) else raw_info
@@ -671,11 +865,12 @@ mcp = FastMCP(
 # Tool endpoints
 @mcp.tool()
 def allow_sketchup_autostart(ctx: Context, allowed: bool = True) -> str:
-    """Allow this MCP server process to start SketchUp when the Ruby port is unreachable."""
-    startup.set_session_autostart_allowed(allowed)
+    """Allow only this MCP session to start SketchUp when its Ruby port is unreachable."""
+    session = _session_from_context(ctx)
+    startup.set_session_autostart_allowed(allowed, session=session)
     return json.dumps({
         "success": True,
-        "autostart_allowed": startup.autostart_allowed(),
+        "autostart_allowed": _autostart_allowed_for_context(ctx),
         "session_autostart_allowed": bool(allowed),
     })
 
@@ -683,7 +878,7 @@ def allow_sketchup_autostart(ctx: Context, allowed: bool = True) -> str:
 def set_connection_port(ctx: Context, port: int) -> str:
     """Set the default port used only when a SketchUp tool call omits port."""
     try:
-        target_port = set_sketchup_port_override(port)
+        target_port = set_sketchup_port_override(port, ctx=ctx)
         return json.dumps({
             "success": True,
             "host": get_sketchup_host(),
@@ -699,10 +894,10 @@ def set_connection_port(ctx: Context, port: int) -> str:
 async def get_instance_info(ctx: Context, port: int | None = None) -> str:
     """Read a target SketchUp listener's identity and active-model fingerprint."""
     try:
-        info = await asyncio.to_thread(_get_instance_info_sync, port)
+        info = await asyncio.to_thread(_get_instance_info_sync, port, ctx=ctx)
         return json.dumps({"success": True, "instance": info})
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def list_sketchup_instances(ctx: Context, ports: List[int] | None = None) -> str:
@@ -717,7 +912,7 @@ async def list_sketchup_instances(ctx: Context, ports: List[int] | None = None) 
 async def get_modal_state(ctx: Context, port: int | None = None) -> str:
     """Inspect a target listener's SketchUp modal state without sending Ruby code."""
     try:
-        target_port = get_sketchup_port(port)
+        target_port = get_sketchup_port(port, ctx=ctx)
         result = await asyncio.to_thread(
             modal_guard.modal_state_for_port,
             get_sketchup_host(),
@@ -726,14 +921,14 @@ async def get_modal_state(ctx: Context, port: int | None = None) -> str:
         )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 
 @mcp.tool()
 async def close_modal(ctx: Context, port: int | None = None) -> str:
     """Close a target listener's detected modal window without waiting for Ruby TCP work."""
     try:
-        target_port = get_sketchup_port(port)
+        target_port = get_sketchup_port(port, ctx=ctx)
         result = await asyncio.to_thread(
             modal_guard.close_modal_for_port,
             get_sketchup_host(),
@@ -742,7 +937,7 @@ async def close_modal(ctx: Context, port: int | None = None) -> str:
         )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def create_component(
@@ -754,7 +949,8 @@ async def create_component(
 ) -> str:
     """Create a component in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool(
+        result, _target = await _send_ruby_tool_for_context(
+            ctx,
             "create_component",
             {"type": type, "position": position or [0, 0, 0], "dimensions": dimensions or [1, 1, 1]},
             _request_id(ctx),
@@ -762,7 +958,7 @@ async def create_component(
         )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def delete_component(
@@ -772,10 +968,12 @@ async def delete_component(
 ) -> str:
     """Delete a component from the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool("delete_component", {"id": id}, _request_id(ctx), port=port)
+        result, _target = await _send_ruby_tool_for_context(
+            ctx, "delete_component", {"id": id}, _request_id(ctx), port=port
+        )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def transform_component(
@@ -795,19 +993,21 @@ async def transform_component(
             arguments["rotation"] = rotation
         if scale is not None:
             arguments["scale"] = scale
-        result, _target = await _send_ruby_tool("transform_component", arguments, _request_id(ctx), port=port)
+        result, _target = await _send_ruby_tool_for_context(
+            ctx, "transform_component", arguments, _request_id(ctx), port=port
+        )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def get_selection(ctx: Context, port: int | None = None) -> str:
     """Get the selection from the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool("get_selection", {}, _request_id(ctx), port=port)
+        result, _target = await _send_ruby_tool_for_context(ctx, "get_selection", {}, _request_id(ctx), port=port)
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def set_material(
@@ -818,12 +1018,12 @@ async def set_material(
 ) -> str:
     """Set material in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool(
-            "set_material", {"id": id, "material": material}, _request_id(ctx), port=port
+        result, _target = await _send_ruby_tool_for_context(
+            ctx, "set_material", {"id": id, "material": material}, _request_id(ctx), port=port
         )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def export_scene(
@@ -833,10 +1033,12 @@ async def export_scene(
 ) -> str:
     """Export the scene from the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool("export", {"format": format}, _request_id(ctx), port=port)
+        result, _target = await _send_ruby_tool_for_context(
+            ctx, "export", {"format": format}, _request_id(ctx), port=port
+        )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def capture_review_views(
@@ -850,7 +1052,8 @@ async def capture_review_views(
 ) -> str:
     """Capture review views from the requested SketchUp listener."""
     try:
-        result, target = await _send_ruby_tool(
+        result, target = await _send_ruby_tool_for_context(
+            ctx,
             "capture_review_views",
             {
                 "persistent_id": persistent_id,
@@ -869,7 +1072,7 @@ async def capture_review_views(
         }
         return json.dumps(response)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def create_mortise_tenon(
@@ -886,7 +1089,8 @@ async def create_mortise_tenon(
 ) -> str:
     """Create a mortise and tenon joint in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool(
+        result, _target = await _send_ruby_tool_for_context(
+            ctx,
             "create_mortise_tenon",
             {
                 "mortise_id": mortise_id,
@@ -903,7 +1107,7 @@ async def create_mortise_tenon(
         )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def create_dovetail(
@@ -922,7 +1126,8 @@ async def create_dovetail(
 ) -> str:
     """Create a dovetail joint in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool(
+        result, _target = await _send_ruby_tool_for_context(
+            ctx,
             "create_dovetail",
             {
                 "tail_id": tail_id,
@@ -941,7 +1146,7 @@ async def create_dovetail(
         )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def create_finger_joint(
@@ -959,7 +1164,8 @@ async def create_finger_joint(
 ) -> str:
     """Create a finger joint in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool(
+        result, _target = await _send_ruby_tool_for_context(
+            ctx,
             "create_finger_joint",
             {
                 "board1_id": board1_id,
@@ -977,7 +1183,7 @@ async def create_finger_joint(
         )
         return json.dumps(result)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
 async def eval_ruby(
@@ -991,7 +1197,9 @@ async def eval_ruby(
         arguments = {"code": code}
         if prevent_modal_hang:
             arguments["prevent_modal_hang"] = True
-        result, target = await _send_ruby_tool("eval_ruby", arguments, _request_id(ctx), port=port)
+        result, target = await _send_ruby_tool_for_context(
+            ctx, "eval_ruby", arguments, _request_id(ctx), port=port
+        )
         response = {
             "success": True,
             "result": _result_text(result),
@@ -1003,14 +1211,34 @@ async def eval_ruby(
     except modal_guard.ModalGuardInterrupted as e:
         payload = e.to_payload()
         payload["host"] = get_sketchup_host()
-        payload["port"] = get_sketchup_port(port)
+        payload["port"] = get_sketchup_port(port, ctx=ctx)
         return json.dumps(payload)
     except Exception as e:
-        return _tool_error(e, port)
+        return _tool_error(e, port, ctx=ctx)
 
-def main():
+
+def main(argv: Optional[List[str]] = None):
+    """Keep stdio as the default while exposing the Streamable HTTP CLI path."""
+    import sys
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    http_option_prefixes = (
+        "--http-port",
+        "--sketchup-port",
+        "--allow-autostart",
+        "--sketchup-executable",
+        "--startup-timeout",
+        "--request-timeout-ms",
+        "--session-idle-timeout",
+        "--host",
+    )
+    if any(argument == prefix or argument.startswith(f"{prefix}=") for argument in arguments for prefix in http_option_prefixes):
+        from . import http_server
+
+        return http_server.main(arguments)
+
     start_idle_watchdog()
-    mcp.run()
+    return mcp.run()
 
 if __name__ == "__main__":
     main()

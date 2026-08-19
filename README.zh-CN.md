@@ -63,11 +63,60 @@ uvx --from . sketchup-mcp-cli --help
 
 ## MCP 客户端配置
 
-SketchupMCP 是一个 stdio MCP server。MCP 客户端会启动 Python 进程，Python 进程再通过本地 TCP 连接到 SketchUp Ruby 扩展。
+SketchupMCP 同时支持共享的 Streamable HTTP 服务和原有的 stdio server；两种传输都会通过本地 TCP 连接 SketchUp Ruby 扩展。对于 Codex，推荐使用下面的共享 HTTP 服务。
 
-### Codex
+### 推荐：Codex 共享 Streamable HTTP 服务
 
-Codex 会读取 `~/.codex/config.toml` 中的 MCP server 配置；如果项目已被信任，也可以使用项目内 `.codex/config.toml`。
+stdio MCP 进程只拥有一个宿主会话的输入/输出管道，多个 Codex 任务不能共享同一个 stdio 进程。因此，按任务启动 stdio 会产生重复的 SketchUp MCP Python 进程。多个 Codex 任务需要共用本机 SketchUp MCP bridge 时，请使用常驻的 Streamable HTTP 服务：`http://127.0.0.1:8765/mcp`。
+
+Bearer Token 必须保存到用户级环境变量 `SKETCHUP_MCP_HTTP_TOKEN`，不要把 Token 明文写入 `config.toml`。登录计划任务和 HTTP daemon 的生命周期都由 `scripts/manage-http-daemon.ps1` 管理。
+
+#### Windows daemon 管理
+
+在仓库根目录的 PowerShell 中运行以下命令。`Install` 会创建或更新当前用户的登录计划任务并启动 daemon；其默认值是 `-AllowAutostart:$true`。
+
+```powershell
+.\scripts\manage-http-daemon.ps1 Install
+.\scripts\manage-http-daemon.ps1 Status
+.\scripts\manage-http-daemon.ps1 Restart
+.\scripts\manage-http-daemon.ps1 RotateToken
+.\scripts\manage-http-daemon.ps1 Uninstall
+.\scripts\manage-http-daemon.ps1 Uninstall -RemoveToken
+```
+
+使用默认 `Install` 时，任何持有有效 Bearer Token 的本机客户端都可以通过 HTTP 服务触发 SketchUp 自动启动。如果这不符合预期，请显式禁用该预授权：
+
+```powershell
+.\scripts\manage-http-daemon.ps1 Install -AllowAutostart:$false
+```
+
+`RotateToken` 会替换用户级 Bearer Token 并重启 daemon。计划任务包装器会在每次启动时重新读取当前用户级 Token，不复用任务引擎旧的进程环境；之后必须重启 Codex，令其读取新 Token。daemon 日志路径为 `%LOCALAPPDATA%\SketchUpMCP\logs\http-daemon.log`，每个文件 5 MiB、最多保留五轮。HTTP 会话正常通过 `DELETE` 关闭后立即清理状态；异常断连的会话会在空闲 1800 秒后回收。
+
+Codex 会读取 `~/.codex/config.toml` 中的 MCP server 配置；如果项目已被信任，也可以使用项目内 `.codex/config.toml`。添加 HTTP 配置（迁移时也可先使用临时名称验证）：
+
+```toml
+[mcp_servers.sketchup_2022]
+url = "http://127.0.0.1:8765/mcp"
+bearer_token_env_var = "SKETCHUP_MCP_HTTP_TOKEN"
+startup_timeout_sec = 20
+tool_timeout_sec = 300
+required = false
+
+[mcp_servers.sketchup_2022.tools.eval_ruby]
+approval_mode = "approve"
+```
+
+修改 MCP 配置或用户环境变量后，必须重启 Codex。安全迁移时，先使用临时 HTTP server 名称完成验证，再切换正式配置；只有验证完成后，才清理可执行文件和启动参数都与旧配置精确匹配的 stdio 进程树。不要终止共享 HTTP daemon 或其他无关 MCP 进程。
+
+如需回滚，请按安全顺序执行：先恢复 stdio 配置并重启 Codex，再运行 `Uninstall` 移除常驻登录任务。Token 默认保留；只有确实需要删除时，最后才运行 `Uninstall -RemoveToken`。
+
+HTTP 会隔离每个 MCP 会话的状态。目标端口按以下顺序确定：工具显式传入的 `port` > 该会话通过 `set_connection_port` 设置的默认端口 > 服务默认端口 `9876`。相同解析端口的调用会串行执行；不同端口的调用可以并行执行。HTTP 服务不使用 idle watchdog。
+
+本方案只处理重复的 **SketchUp MCP** 进程；不会启动、停止、共享或去重 Chrome、IDA、PPT 等其他 MCP 服务。
+
+### 旧版 stdio：兼容与回滚
+
+原有 stdio 传输仍保留用于兼容和回滚。它会为每个 MCP 宿主会话启动一个 Python 进程，因此不要让多个 Codex 任务尝试共享同一个 stdio 实例。
 
 ```toml
 [mcp_servers.sketchup]
@@ -80,7 +129,7 @@ tool_timeout_sec = 300
 SKETCHUP_MCP_PORT = "9876"
 ```
 
-默认情况下，MCP server 不会自行打开 SketchUp。如果 Ruby 端口不可达，工具响应会提示智能体询问用户是否允许启动 SketchUp。用户同意后，先调用 `allow_sketchup_autostart`，再重试 SketchUp 工具调用。
+默认情况下，旧版 stdio server 不会自行打开 SketchUp。如果 Ruby 端口不可达，工具响应会提示智能体询问用户是否允许启动 SketchUp。用户同意后，先调用 `allow_sketchup_autostart`，再重试 SketchUp 工具调用。
 
 如果希望预先允许这个 MCP server 启动 SketchUp，可以添加自动启动环境变量：
 
@@ -98,7 +147,7 @@ SKETCHUP_MCP_IDLE_TIMEOUT_SEC = "0"
 
 每个 Python 到 SketchUp 的请求都会包含发送时间戳和 `SKETCHUP_MCP_REQUEST_TIMEOUT_MS`。如果 SketchUp 正忙，直到超时后才处理 socket，请求会被 Ruby 扩展丢弃，不会继续执行过期命令。
 
-`SKETCHUP_MCP_IDLE_TIMEOUT_SEC` 控制空闲 stdio MCP 进程在最后一次 SketchUp 命令后可以存活多久。默认值为 `0`，即保持 bridge 常驻并关闭空闲 watchdog。只有当 MCP host 能自动重启过期 bridge 时才应设置正数；否则 watchdog 退出进程后，host 可能提示 `Transport closed`。
+`SKETCHUP_MCP_IDLE_TIMEOUT_SEC` 只适用于旧版 stdio 进程，用于控制它在最后一次 SketchUp 命令后可以空闲存活多久。默认值为 `0`，即保持 bridge 常驻并关闭 idle watchdog。共享 HTTP 服务不使用该 watchdog。
 
 `SKETCHUP_MCP_PORT` 只定义默认目标端口。一个 MCP server 已可按每次工具调用的显式 `port` 路由到不同的本机 SketchUp，因此日常多实例操作不再需要为每个端口额外配置 MCP server。
 
@@ -131,23 +180,23 @@ opencode 可以通过 `opencode mcp add` 或 `opencode.json` 配置 MCP。项目
 
 ### 启动连接
 
-1. 在 SketchUp 中打开 Extensions > MCP Server > Start Server。
-2. server 会在默认端口 `9876` 上启动。
-3. 启动 Codex、opencode 或其他已配置的 MCP 客户端。
+1. 在 SketchUp 中加载扩展，Ruby listener 会自动启动。
+2. listener 从 `9876` 开始尝试，并递增到第一个可绑定的端口。
+3. 通过 Extensions > MCP Server > Current Port 查看最终使用的端口。
+4. 启动 Codex、opencode 或其他已配置的 MCP 客户端。
 
-SketchUp 的 `Extensions > MCP Server` 菜单是本地 server 控制面板。`Start Server` 启动 Ruby 侧 TCP listener，`Stop Server` 暂停服务，`Current Port` 显示当前监听端口，`Set Port...` 可以在启动前修改端口。多实例场景下，给每个 SketchUp 实例分配不同端口即可。
+SketchUp 的 `Extensions > MCP Server` 菜单是本地 server 控制面板。`Start Server` 可在停止后重新启动 Ruby 侧 TCP listener，`Stop Server` 暂停服务，`Current Port` 显示当前监听端口，`Set Port...` 可以在手动启动前修改端口。多实例场景下，每个实例会自动选择不同的可用端口。
 
 ![MCP Server 菜单，显示当前端口、设置端口、启动和停止控制](docs/images/mcp-server-menu.png)
 
 ### 使用多个 SketchUp 实例
 
-每个 SketchUp 实例都会运行自己的本地 TCP server。要同时连接多个实例，需要给每个 SketchUp 实例设置不同端口：
+每个 SketchUp 实例都会运行自己的本地 TCP server。要同时连接多个实例：
 
-1. 在 SketchUp 中打开 Extensions > MCP Server > Set Port...
-2. 输入一个端口，例如 `9876`、`9877` 或 `9878`。
-3. 使用 Current Port 菜单项确认当前端口。
-4. 通过 Extensions > MCP Server > Start Server 启动 server。
-5. 在 MCP 对话中调用 `list_sketchup_instances` 确认已运行窗口，或直接使用已知端口。
+1. 在每个 SketchUp 实例中加载扩展；listener 会从 `9876` 开始自动选择第一个可用端口。
+2. 使用 Current Port 菜单项确认每个实例的当前端口。
+3. 如需手动指定端口，先停止 server，通过 Extensions > MCP Server > Set Port... 设置，再通过 Extensions > MCP Server > Start Server 启动。
+4. 在 MCP 对话中调用 `list_sketchup_instances` 确认已运行窗口，或直接使用已知端口。
 
 所有 SketchUp 工具都支持可选 `port`。例如调用
 `eval_ruby(code="Sketchup.active_model.title", port=9877)` 或
