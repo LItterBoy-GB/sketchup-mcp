@@ -75,6 +75,8 @@ Bearer Token 必须保存到用户级环境变量 `SKETCHUP_MCP_HTTP_TOKEN`，�
 
 在仓库根目录的 PowerShell 中运行以下命令。`Install` 会创建或更新当前用户的登录计划任务并启动 daemon；其默认值是 `-AllowAutostart:$true`。
 
+计划任务直接启动 `.venv\Scripts\pythonw.exe`，不经过 PowerShell 或 CMD 控制台，因此登录启动、`Start` 和 `Restart` 都不会弹出或闪现黑框。升级旧任务后需重新执行一次 `Install`，仅执行 `Restart` 不会更新旧任务的启动入口。手动执行管理命令时已有的终端窗口不受影响。
+
 ```powershell
 .\scripts\manage-http-daemon.ps1 Install
 .\scripts\manage-http-daemon.ps1 Status
@@ -90,7 +92,7 @@ Bearer Token 必须保存到用户级环境变量 `SKETCHUP_MCP_HTTP_TOKEN`，�
 .\scripts\manage-http-daemon.ps1 Install -AllowAutostart:$false
 ```
 
-`RotateToken` 会替换用户级 Bearer Token 并重启 daemon。计划任务包装器会在每次启动时重新读取当前用户级 Token，不复用任务引擎旧的进程环境；之后必须重启 Codex，令其读取新 Token。daemon 日志路径为 `%LOCALAPPDATA%\SketchUpMCP\logs\http-daemon.log`，每个文件 5 MiB、最多保留五轮。HTTP 会话正常通过 `DELETE` 关闭后立即清理状态；异常断连的会话会在空闲 1800 秒后回收。
+`RotateToken` 会替换用户级 Bearer Token 并重启 daemon。无控制台 Python 入口会在每次启动时重新读取当前用户级 Token（直接读取注册表），不复用任务引擎旧的进程环境；之后必须重启 Codex，令其读取新 Token。daemon 日志路径为 `%LOCALAPPDATA%\SketchUpMCP\logs\http-daemon.log`，每个文件 5 MiB、最多保留五轮。入口的启动失败记录在同目录的 `http-launcher.log`，每个文件 1 MiB、最多保留三轮，进程以非零状态退出以触发计划任务的异常重试。HTTP 会话正常通过 `DELETE` 关闭后立即清理状态；异常断连的会话会在空闲 1800 秒后回收。
 
 Codex 会读取 `~/.codex/config.toml` 中的 MCP server 配置；如果项目已被信任，也可以使用项目内 `.codex/config.toml`。添加 HTTP 配置（迁移时也可先使用临时名称验证）：
 

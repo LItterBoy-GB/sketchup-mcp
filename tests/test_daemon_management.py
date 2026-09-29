@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,6 +10,52 @@ SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "manage-http-daemon.ps1"
 
 
 class DaemonManagementTests(unittest.TestCase):
+    def test_stop_scopes_processes_and_rechecks_pid_identity(self):
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is not installed")
+        source = SCRIPT_PATH.read_text(encoding="utf-8").split('switch ($Action)', 1)[0]
+        source += r'''
+$script:RepositoryRoot = 'H:\test-bridge'
+$script:PythonPath = 'H:\test-bridge\.venv\Scripts\pythonw.exe'
+$script:terminated = @()
+$command = 'pythonw.exe -m sketchup_mcp.http_daemon --http-port 8765'
+$script:fixtures = @(
+    [pscustomobject]@{ProcessId=1; ParentProcessId=100; ExecutablePath=$script:PythonPath; CommandLine=$command; CreationDate=1},
+    [pscustomobject]@{ProcessId=2; ParentProcessId=1; ExecutablePath='C:\runtime\pythonw.exe'; CommandLine=$command; CreationDate=1},
+    [pscustomobject]@{ProcessId=3; ParentProcessId=100; ExecutablePath='H:\other\.venv\Scripts\pythonw.exe'; CommandLine=$command; CreationDate=1},
+    [pscustomobject]@{ProcessId=4; ParentProcessId=100; ExecutablePath=$script:PythonPath; CommandLine=($command -replace '8765','8766'); CreationDate=1}
+)
+function Get-CimInstance {
+    param($ClassName, $Filter, $ErrorAction)
+    if ($Filter -match '^ProcessId = (\d+)$') {
+        $found = $script:fixtures | Where-Object ProcessId -eq ([int]$Matches[1])
+        if ($found.ProcessId -eq 2) {
+            # 模拟 PID 被复用，禁止终止这个新进程。
+            return [pscustomobject]@{ProcessId=2; ExecutablePath=$found.ExecutablePath; CommandLine=$found.CommandLine; CreationDate=2}
+        }
+        return $found
+    }
+    return $script:fixtures
+}
+function Get-BridgeTask { return [pscustomobject]@{State='Ready'} }
+function Invoke-CimMethod {
+    param($InputObject, $MethodName)
+    $script:terminated += $InputObject.ProcessId
+    return [pscustomobject]@{ReturnValue=0}
+}
+$selected = @(Get-BridgeProcessIds)
+if (($selected -join ',') -ne '2,1') { throw "Wrong process selection: $selected" }
+Stop-BridgeTask
+if (($script:terminated -join ',') -ne '1') { throw "Unsafe termination: $script:terminated" }
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            probe = Path(directory) / "scoped-stop.ps1"
+            probe.write_text(source, encoding="utf-8-sig")
+            result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_http_console_script_is_packaged(self):
         project = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         requirements = (REPOSITORY_ROOT / "requirements.txt").read_text(encoding="utf-8")
@@ -27,12 +74,9 @@ class DaemonManagementTests(unittest.TestCase):
 
         for required_text in (
             '$script:TaskName = "SketchUpMCP HTTP Bridge"',
-            '.venv\\Scripts\\python.exe',
-            'System32\\WindowsPowerShell\\v1.0\\powershell.exe',
-            '"-ExecutionPolicy"',
-            '"Bypass"',
+            '.venv\\Scripts\\pythonw.exe',
             '"Run"',
-            '"sketchup_mcp.http_server"',
+            '"sketchup_mcp.http_daemon"',
             '"--http-port"',
             '"--sketchup-port"',
             '"--allow-autostart"',
@@ -48,7 +92,6 @@ class DaemonManagementTests(unittest.TestCase):
             'New-Object byte[] 32',
             'SKETCHUP_MCP_HTTP_TOKEN',
             'SendMessageTimeout',
-            'SetEnvironmentVariable($script:TokenEnvironmentVariable, $token, "Process")',
             '/healthz',
         ):
             self.assertIn(required_text, script)
@@ -59,13 +102,9 @@ class DaemonManagementTests(unittest.TestCase):
     def test_task_runner_refreshes_token_without_exposing_it_in_task_arguments(self):
         script = SCRIPT_PATH.read_text(encoding="utf-8")
 
-        self.assertIn("$token = Get-UserToken", script)
-        self.assertIn(
-            '[Environment]::SetEnvironmentVariable($script:TokenEnvironmentVariable, $token, "Process")',
-            script,
-        )
-        self.assertIn("$pythonArguments = Get-BridgePythonArguments", script)
-        self.assertIn("& $script:PythonPath @pythonArguments", script)
+        self.assertIn('-Execute $script:PythonPath', script)
+        self.assertNotIn('powershell.exe', script.lower())
+        self.assertNotIn('$script:PowerShellPath', script)
         task_arguments = script.split("function Get-BridgeTaskArguments", 1)[1].split(
             "function Assert-BridgeLaunchPrerequisites", 1
         )[0]

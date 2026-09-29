@@ -36,9 +36,7 @@ $script:TaskName = "SketchUpMCP HTTP Bridge"
 $script:TaskPath = "\"
 $script:TokenEnvironmentVariable = "SKETCHUP_MCP_HTTP_TOKEN"
 $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
-$script:PythonPath = Join-Path $script:RepositoryRoot ".venv\Scripts\python.exe"
-$script:PowerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$script:ManagementScriptPath = $PSCommandPath
+$script:PythonPath = Join-Path $script:RepositoryRoot ".venv\Scripts\pythonw.exe"
 $script:CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $script:DefaultLogPath = "%LOCALAPPDATA%\SketchUpMCP\logs\http-daemon.log"
 
@@ -140,7 +138,7 @@ function ConvertTo-TaskArgument {
 function Get-BridgePythonArguments {
     $arguments = @(
         "-m",
-        "sketchup_mcp.http_server",
+        "sketchup_mcp.http_daemon",
         "--http-port",
         $HttpPort.ToString([Globalization.CultureInfo]::InvariantCulture),
         "--sketchup-port",
@@ -163,34 +161,7 @@ function Get-BridgePythonArguments {
 }
 
 function Get-BridgeTaskArguments {
-    $arguments = @(
-        "-NoProfile",
-        "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        $script:ManagementScriptPath,
-        "Run",
-        "-HttpPort",
-        $HttpPort.ToString([Globalization.CultureInfo]::InvariantCulture),
-        "-SketchUpPort",
-        $SketchUpPort.ToString([Globalization.CultureInfo]::InvariantCulture),
-        "-SketchUpExecutable",
-        $SketchUpExecutable,
-        "-StartupTimeout",
-        $StartupTimeout.ToString([Globalization.CultureInfo]::InvariantCulture),
-        "-RequestTimeoutMs",
-        $RequestTimeoutMs.ToString([Globalization.CultureInfo]::InvariantCulture),
-        "-SessionIdleTimeout",
-        $SessionIdleTimeout.ToString([Globalization.CultureInfo]::InvariantCulture)
-    )
-
-    if (-not $AllowAutostart) {
-        $arguments += "-DisableAutostart"
-    }
-
+    $arguments = Get-BridgePythonArguments
     return ($arguments | ForEach-Object { ConvertTo-TaskArgument -Value ([string]$_) }) -join " "
 }
 
@@ -198,26 +169,16 @@ function Assert-BridgeLaunchPrerequisites {
     if (-not (Test-Path -LiteralPath $script:PythonPath -PathType Leaf)) {
         throw "Expected virtual-environment launcher was not found: $script:PythonPath"
     }
-    if (-not (Test-Path -LiteralPath $script:PowerShellPath -PathType Leaf)) {
-        throw "Expected Windows PowerShell launcher was not found: $script:PowerShellPath"
-    }
 }
 
 function Invoke-BridgeDaemon {
     Assert-BridgeLaunchPrerequisites
 
-    $token = Get-UserToken
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        throw "User-scoped environment variable '$script:TokenEnvironmentVariable' is not set. Run Install first."
-    }
-
-    # Refresh the process environment on every scheduled-task launch. The
-    # Python child inherits this current value instead of Taskeng's cached copy.
-    [Environment]::SetEnvironmentVariable($script:TokenEnvironmentVariable, $token, "Process")
-    $pythonArguments = Get-BridgePythonArguments
-    & $script:PythonPath @pythonArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "SketchUp MCP HTTP daemon exited with code $LASTEXITCODE."
+    $process = Start-Process -FilePath $script:PythonPath `
+        -ArgumentList (Get-BridgeTaskArguments) `
+        -WorkingDirectory $script:RepositoryRoot -WindowStyle Hidden -PassThru -Wait
+    if ($process.ExitCode -ne 0) {
+        throw "SketchUp MCP HTTP daemon exited with code $($process.ExitCode). See http-launcher.log."
     }
 }
 
@@ -232,13 +193,13 @@ function Install-BridgeTask {
 
     $tokenCreated = Ensure-UserToken
     $existingTask = Get-BridgeTask
-    if ($null -ne $existingTask -and (Test-BridgeTaskActiveState -Task $existingTask)) {
+    if ($null -ne $existingTask) {
         Stop-BridgeTask
         Wait-BridgeTaskStopped
     }
 
     $taskAction = New-ScheduledTaskAction `
-        -Execute $script:PowerShellPath `
+        -Execute $script:PythonPath `
         -Argument (Get-BridgeTaskArguments) `
         -WorkingDirectory $script:RepositoryRoot
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $script:CurrentUser
@@ -272,10 +233,23 @@ function Start-BridgeTask {
 
 function Stop-BridgeTask {
     Assert-BridgeTaskInstalled
+    # 在停止任务前记录父子关系；Windows 虚拟环境启动器退出后可能留下实际解释器。
+    $bridgeProcesses = @(Get-BridgeProcesses)
     $task = Get-BridgeTask
     if (Test-BridgeTaskActiveState -Task $task) {
         # The exact task owns the bridge process; do not terminate unrelated Python processes.
         Stop-ScheduledTask -TaskName $script:TaskName -TaskPath $script:TaskPath
+    }
+    foreach ($process in $bridgeProcesses) {
+        $current = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ProcessId)" -ErrorAction SilentlyContinue
+        # 防止 PID 被复用；只终止事先确认属于本仓库、指定端口的 bridge。
+        if ($null -ne $current -and $current.CreationDate -eq $process.CreationDate -and
+            $current.ExecutablePath -eq $process.ExecutablePath -and $current.CommandLine -eq $process.CommandLine) {
+            $result = Invoke-CimMethod -InputObject $current -MethodName Terminate
+            if ($result.ReturnValue -ne 0) {
+                throw "Could not stop bridge process $($process.ProcessId): $($result.ReturnValue)"
+            }
+        }
     }
     Write-Output "Stopped '$script:TaskName'."
 }
@@ -299,19 +273,24 @@ function Restart-BridgeTask {
     Start-BridgeTask
 }
 
-function Get-BridgeProcessIds {
-    $modulePattern = [regex]::Escape("sketchup_mcp.http_server")
+function Get-BridgeProcesses {
+    $modulePattern = 'sketchup_mcp\.http_(?:daemon|server)'
     $httpPortPattern = [regex]::Escape($HttpPort.ToString([Globalization.CultureInfo]::InvariantCulture))
+    $candidates = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe'" |
+        Where-Object {
+            $_.CommandLine -match "(?i)(?:^|\s)-m\s+$modulePattern(?:\s|$)" -and
+            $_.CommandLine -match "(?i)(?:^|\s)--http-port\s+$httpPortPattern(?:\s|$)"
+        })
+    $legacyPythonPath = Join-Path $script:RepositoryRoot '.venv\Scripts\python.exe'
+    $roots = @($candidates | Where-Object { $_.ExecutablePath -in @($script:PythonPath, $legacyPythonPath) })
+    # 先返回启动器的直接子进程，再返回启动器；不按名称批量清理 Python。
+    $rootIds = @($roots | ForEach-Object { $_.ProcessId })
+    @($candidates | Where-Object { $_.ParentProcessId -in $rootIds -and $_.ProcessId -notin $rootIds })
+    $roots
+}
 
-    return @(
-        Get-CimInstance -ClassName Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.ExecutablePath -ieq $script:PythonPath -and
-                $_.CommandLine -match "(?i)(?:^|\s)-m\s+$modulePattern(?:\s|$)" -and
-                $_.CommandLine -match "(?i)(?:^|\s)--http-port\s+$httpPortPattern(?:\s|$)"
-            } |
-            ForEach-Object { $_.ProcessId }
-    )
+function Get-BridgeProcessIds {
+    return @(Get-BridgeProcesses | ForEach-Object { $_.ProcessId })
 }
 
 function Get-HealthCheck {
@@ -348,6 +327,7 @@ function Show-BridgeStatus {
         LastTaskResult = if ($null -ne $taskInfo) { $taskInfo.LastTaskResult } else { $null }
         HttpEndpoint = "http://127.0.0.1:$HttpPort"
         LogPath = $script:DefaultLogPath
+        LauncherLogPath = "%LOCALAPPDATA%\SketchUpMCP\logs\http-launcher.log"
         Health = $health.Status
         HealthDetail = $health.Detail
         Token = if ([string]::IsNullOrWhiteSpace((Get-UserToken))) { "absent" } else { "present" }
@@ -370,10 +350,8 @@ function Rotate-BridgeToken {
 function Uninstall-BridgeTask {
     $task = Get-BridgeTask
     if ($null -ne $task) {
-        if (Test-BridgeTaskActiveState -Task $task) {
-            Stop-BridgeTask
-            Wait-BridgeTaskStopped
-        }
+        Stop-BridgeTask
+        Wait-BridgeTaskStopped
         Unregister-ScheduledTask -TaskName $script:TaskName -TaskPath $script:TaskPath -Confirm:$false
         Write-Output "Uninstalled '$script:TaskName'. Repository files and logs were preserved."
     }

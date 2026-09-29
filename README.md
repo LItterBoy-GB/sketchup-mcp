@@ -87,6 +87,14 @@ Run these commands from the repository root in PowerShell. `Install` creates
 or updates the current user's logon scheduled task and starts the daemon; its
 default is `-AllowAutostart:$true`.
 
+The scheduled task directly launches `.venv\Scripts\pythonw.exe`, without a
+PowerShell or CMD console, so logon, `Start`, and `Restart` do not flash a console
+window. Run `Install` once to upgrade an existing task; `Restart` alone retains
+its old launch action. An existing terminal used for management commands stays open.
+The console-free Python entry point reads the current user token from the registry
+on every launch. Bootstrap failures go to `%LOCALAPPDATA%\SketchUpMCP\logs\http-launcher.log`
+(1 MiB, three backups) and exit nonzero so Task Scheduler can retry.
+
 ```powershell
 .\scripts\manage-http-daemon.ps1 Install
 .\scripts\manage-http-daemon.ps1 Status
