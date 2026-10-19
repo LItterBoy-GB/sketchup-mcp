@@ -179,6 +179,11 @@ module SU_MCP
 
                       if request_expired?(request)
                         log "Dropped expired request: #{request.inspect}"
+                        write_json_response(client, {
+                          jsonrpc: "2.0", id: request["id"],
+                          error: { code: -32001, message: "Request expired before execution",
+                                   data: { execution_state: "not_started", type: "RequestExpired" } }
+                        })
                       else
                         log "Processed request: #{request.inspect}"
                         response = handle_jsonrpc_request(request)
@@ -705,7 +710,7 @@ module SU_MCP
         model_path: model && model.respond_to?(:path) ? model.path.to_s : '',
         selected_page: selected_page ? selected_page.name.to_s : ''
       }
-      { success: true, result: JSON.generate(info) }
+      { success: true, result: JSON.generate(info), value: info }
     end
 
     def handle_tool_call(request)
@@ -760,6 +765,13 @@ module SU_MCP
             resourceId: result[:id]
           }
           response_result[:ui_events] = result[:ui_events] if result[:ui_events]
+          if result.key?(:value)
+            response_result[:value] = result[:value]
+          elsif result.key?(:result)
+            response_result[:value] = result[:result]
+          else
+            response_result[:value] = result.reject { |key, _value| key == :success }
+          end
           response = {
             jsonrpc: request["jsonrpc"] || "2.0",
             result: response_result,
@@ -780,14 +792,15 @@ module SU_MCP
           log "Sending error response: #{response.inspect}"
           response
         end
-      rescue StandardError => e
+      rescue StandardError, ScriptError => e
         log "Tool call error: #{e.message}"
         response = {
           jsonrpc: request["jsonrpc"] || "2.0",
           error: { 
             code: -32603, 
             message: e.message,
-            data: { success: false }
+            data: { success: false, type: e.class.name, backtrace: e.backtrace,
+                    execution_state: "failed" }
           },
           id: request["id"]
         }
@@ -1290,7 +1303,8 @@ module SU_MCP
 
         {
           success: true,
-          result: JSON.generate(result)
+          result: JSON.generate(result),
+          value: result
         }
       ensure
         if hide_others
@@ -2458,19 +2472,21 @@ module SU_MCP
         end
         log "Code evaluation completed with result: #{result.inspect}"
 
-        # Return success with the result as a string
+        # 保留旧文本字段，同时向新客户端返回原生 JSON 值。
         response = {
           success: true,
-          result: result.to_s
+          result: result.to_s,
+          value: eval_ruby_json_value(result)
         }
         response[:ui_events] = ui_events unless ui_events.empty?
         response
-      rescue StandardError => e
+      rescue StandardError, ScriptError => e
         error = e
         status = "error"
         log "Error in eval_ruby: #{e.message}"
         log e.backtrace.join("\n")
-        raise "Ruby evaluation error: #{e.message}"
+        # 语法错误也走工具错误通道，保留原始异常类型和调用栈。
+        raise e
       ensure
         append_eval_ruby_log_entry(
           code: code,
@@ -2482,6 +2498,17 @@ module SU_MCP
           ui_events: ui_events
         )
       end
+    end
+
+    def eval_ruby_json_value(value)
+      case value
+      when Hash, Array, String, Numeric, TrueClass, FalseClass, NilClass
+        JSON.parse(JSON.generate(value))
+      else
+        value.to_s
+      end
+    rescue JSON::JSONError, SystemStackError
+      value.to_s
     end
   end
 

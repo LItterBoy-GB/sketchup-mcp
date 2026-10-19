@@ -201,7 +201,8 @@ def main(
                 eval_arguments,
                 request_id=1,
             )
-            _write_json(stdout, result)
+            from .server import _ruby_result
+            _write_json(stdout, _ruby_result(result, {"host": connection.host, "port": connection.port}).structuredContent)
             return 0
 
         if args.command == "call":
@@ -210,12 +211,16 @@ def main(
                 load_call_arguments(args),
                 request_id=1,
             )
-            _write_json(stdout, result)
+            from .server import _ruby_result
+            _write_json(stdout, _ruby_result(result, {"host": connection.host, "port": connection.port}).structuredContent)
             return 0
 
         raise ValueError(f"Unsupported command: {args.command}")
     except Exception as exc:
-        _write_json(stderr, modal_guard.payload_from_exception(exc) or {"success": False, "error": str(exc)})
+        from .server import _error_payload
+        host = connection.host if connection is not None else args.host or DEFAULT_SKETCHUP_HOST
+        port = connection.port if connection is not None else args.port
+        _write_json(stderr, _error_payload(exc, host, port))
         return 1
     finally:
         if connection is not None:

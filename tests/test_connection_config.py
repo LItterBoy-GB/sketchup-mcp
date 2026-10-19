@@ -81,8 +81,8 @@ class ConnectionConfigTests(unittest.TestCase):
     def test_set_connection_port_tool_returns_current_target(self):
         result = server.set_connection_port(None, 9878)
 
-        self.assertIn('"success": true', result)
-        self.assertIn('"port": 9878', result)
+        self.assertTrue(result.structuredContent["success"])
+        self.assertEqual(result.structuredContent["port"], 9878)
         self.assertEqual(server.get_sketchup_port(), 9878)
 
     def test_connection_failure_does_not_autostart_without_permission(self):
@@ -125,8 +125,8 @@ class ConnectionConfigTests(unittest.TestCase):
     def test_allow_sketchup_autostart_tool_records_user_permission(self):
         result = server.allow_sketchup_autostart(None, True)
 
-        self.assertIn('"success": true', result)
-        self.assertIn('"autostart_allowed": true', result)
+        self.assertTrue(result.structuredContent["success"])
+        self.assertTrue(result.structuredContent["autostart_allowed"])
         self.assertTrue(server.startup.autostart_allowed())
 
     def test_connection_error_tells_agent_to_ask_user_before_autostart(self):
@@ -257,7 +257,7 @@ class ConnectionConfigTests(unittest.TestCase):
             )
 
         with patch.object(server, "_send_ruby_tool", new=AsyncMock(side_effect=send_tool)):
-            response = json.loads(asyncio.run(server.eval_ruby(FakeContext(), "1 + 1", prevent_modal_hang=True, port=9878)))
+            response = asyncio.run(server.eval_ruby(FakeContext(), "1 + 1", prevent_modal_hang=True, port=9878)).structuredContent
 
         self.assertEqual(sent["method"], "tools/call")
         self.assertEqual(sent["params"]["name"], "eval_ruby")
@@ -280,10 +280,10 @@ class ConnectionConfigTests(unittest.TestCase):
         }
 
         with patch.object(server.modal_guard, "modal_state_for_port", return_value=expected) as state_for_port:
-            response = json.loads(asyncio.run(server.get_modal_state(FakeContext(), port=9877)))
+            response = asyncio.run(server.get_modal_state(FakeContext(), port=9877)).structuredContent
 
         state_for_port.assert_called_once_with("localhost", 9877, request_id=123)
-        self.assertEqual(response, expected)
+        self.assertEqual(response, {**expected, "target": {"host": "localhost", "port": 9877}})
 
     def test_close_modal_uses_configured_connection_target_without_ruby_request(self):
         class FakeContext:
@@ -299,10 +299,10 @@ class ConnectionConfigTests(unittest.TestCase):
         }
 
         with patch.object(server.modal_guard, "close_modal_for_port", return_value=expected) as close_for_port:
-            response = json.loads(asyncio.run(server.close_modal(FakeContext(), port=9877)))
+            response = asyncio.run(server.close_modal(FakeContext(), port=9877)).structuredContent
 
         close_for_port.assert_called_once_with("localhost", 9877, request_id=123)
-        self.assertEqual(response, expected)
+        self.assertEqual(response, {**expected, "target": {"host": "localhost", "port": 9877}})
 
     def test_modal_guard_runs_on_eval_timeout_when_prevent_modal_hang_enabled(self):
         class FakeSocket:
@@ -364,7 +364,7 @@ class ConnectionConfigTests(unittest.TestCase):
             patch.object(connection, "receive_full_response", side_effect=socket.timeout("timed out")),
             patch("sketchup_mcp.server.modal_guard.interrupt_modal_for_port") as guard,
         ):
-            with self.assertRaisesRegex(Exception, "Connection to Sketchup lost"):
+            with self.assertRaisesRegex(server.RequestOutcomeUnknown, "not replayed"):
                 connection.send_command("eval_ruby", {"code": "1 + 1"}, request_id=9)
 
         guard.assert_not_called()

@@ -35,7 +35,7 @@ class SketchupStartupTests(unittest.TestCase):
             sketchup_exe = Path(temp_dir) / "SketchUp.exe"
             sketchup_exe.write_text("", encoding="utf-8")
 
-            with patch("subprocess.Popen") as popen:
+            with patch("subprocess.Popen") as popen, patch.object(startup.tempfile, "gettempdir", return_value=temp_dir):
                 script_path = startup.launch_sketchup(9877, sketchup_exe=str(sketchup_exe))
 
             self.assertEqual(

@@ -265,6 +265,16 @@ sketchup-mcp-cli --port 9877 --start-sketchup-if-needed --sketchup-exe "C:\Progr
 
 ## 故障排查
 
+### 会话恢复、超时与结果格式
+
+HTTP 会话失效后，服务会对旧 `Mcp-Session-Id` 返回 404。客户端需要创建新客户端并重新初始化，不能持续重试旧会话。本机 dsh 源码中的 MCP 连接监督器已支持这一恢复流程，使用原有退避和次数限制；需要重新构建并加载修复后的 dsh 才会生效。会话默认端口和临时启动授权属于旧会话，恢复后应重新设置；多实例调用应始终显式传入 `port`。恢复连接不会自动重放失败的工具调用。
+
+Python bridge 只允许 `ping`、`get_instance_info` 和 `get_selection` 在连接故障后重试。任意 Ruby、修改模型和未知工具一旦开始发送，就不会因超时、断连或无效响应被自动重发；此时返回 `execution_unknown`，`error.execution_state` 为 `unknown`，`retryable` 为 `false`。这表示命令可能仍在执行或已经完成，必须先检查目标模型；超时不代表取消或回滚。分块接收使用总截止时间，不会因持续收到少量数据而无限延长。
+
+MCP 工具直接返回 `structuredContent` JSON 对象，兼容文本块包含同一对象；不再返回包裹 JSON 的字符串。Ruby 工具成功结果包含 `success`、`result` 和 `target`，失败结果包含结构化 `error`，并设置 MCP `isError: true`。错误包含 `code`、`type`、`message`、`execution_state`、`retryable`，Ruby 异常还包含调用栈。CLI 的 `eval`、`call` 采用相同结果字段，失败时写入 stderr 并返回非零退出码。
+
+更新 Ruby 扩展后，`eval_ruby` 的对象、数组、数值、布尔值和 `nil` 保留 JSON 类型；字符串保持字符串，其他 Ruby 对象转为文本。旧 Ruby 扩展的文本响应仍然可读，但无法恢复已经丢失的类型。`get_selection` 返回实体信息，截图结果返回路径对象。Ruby 扩展需要重载或重启 SketchUp；Python HTTP daemon 需要重启才能加载新代码。源码测试通过不代表当前运行中的客户端和扩展已经更新。
+
 * **连接问题**：确认 SketchUp 扩展 server 和 Python MCP server 都在运行。
 * **命令失败**：检查 SketchUp Ruby Console 中的错误信息。
 * **超时错误**：尝试简化请求，或拆成多个更小的步骤。

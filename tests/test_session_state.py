@@ -32,8 +32,8 @@ class SessionStateTests(unittest.TestCase):
         first = _Context(_Session())
         second = _Context(_Session())
 
-        self.assertEqual(json.loads(server.set_connection_port(first, 9877))["port"], 9877)
-        self.assertEqual(json.loads(server.set_connection_port(second, 9878))["port"], 9878)
+        self.assertEqual(server.set_connection_port(first, 9877).structuredContent["port"], 9877)
+        self.assertEqual(server.set_connection_port(second, 9878).structuredContent["port"], 9878)
 
         self.assertEqual(server.get_sketchup_port(ctx=first), 9877)
         self.assertEqual(server.get_sketchup_port(ctx=second), 9878)
@@ -43,7 +43,7 @@ class SessionStateTests(unittest.TestCase):
         first = _Context(_Session())
         second = _Context(_Session())
 
-        allowed = json.loads(server.allow_sketchup_autostart(first, True))
+        allowed = server.allow_sketchup_autostart(first, True).structuredContent
 
         self.assertTrue(allowed["autostart_allowed"])
         self.assertTrue(startup.autostart_allowed(first.session))

@@ -50,7 +50,9 @@ class CaptureReviewViewsTests(unittest.TestCase):
                 port=9877,
             ))
 
-        parsed = json.loads(result)
+        parsed = result.structuredContent
+        self.assertFalse(result.isError)
+        self.assertEqual(json.loads(result.content[0].text), parsed)
         self.assertTrue(parsed["success"])
         self.assertEqual(parsed["target"], {"host": "localhost", "port": 9877})
         self.assertEqual(captured["method"], "tools/call")

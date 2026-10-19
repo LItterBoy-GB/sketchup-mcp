@@ -1,4 +1,5 @@
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.types import CallToolResult, TextContent
 import socket
 import json
 import asyncio
@@ -33,6 +34,18 @@ REQUEST_TIMEOUT_ENV = "SKETCHUP_MCP_REQUEST_TIMEOUT_MS"
 DEFAULT_IDLE_TIMEOUT_SEC = 0.0
 IDLE_TIMEOUT_ENV = "SKETCHUP_MCP_IDLE_TIMEOUT_SEC"
 CONTENT_LENGTH_PREFIX = b"Content-Length:"
+# 仅这些读取操作允许重发；任意 Ruby 和未知工具均按可能修改模型处理。
+REPLAY_SAFE_TOOLS = frozenset({"ping", "get_instance_info", "get_selection"})
+
+
+class RequestOutcomeUnknown(ConnectionError):
+    """A request may have executed; callers must inspect state before retrying."""
+
+
+class RubyToolError(Exception):
+    def __init__(self, error: Dict[str, Any]):
+        self.details = error
+        super().__init__(error.get("message", "SketchUp operation failed"))
 
 @dataclass
 class _ServiceDefaults:
@@ -240,15 +253,19 @@ class SketchupConnection:
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
         effective_timeout_ms = get_request_timeout_ms() if timeout_ms is None else timeout_ms
-        sock.settimeout(effective_timeout_ms / 1000)
+        deadline = time.monotonic() + effective_timeout_ms / 1000
         
         try:
             while True:
                 try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("Response deadline exceeded")
+                    sock.settimeout(remaining)
                     chunk = sock.recv(buffer_size)
                     if not chunk:
                         if not chunks:
-                            raise Exception("Connection closed before receiving any data")
+                            raise ConnectionError("Connection closed before receiving any data")
                         break
                     
                     chunks.append(chunk)
@@ -265,7 +282,7 @@ class SketchupConnection:
                         json.loads(data.decode('utf-8'))
                         logger.info(f"Received complete response ({len(data)} bytes)")
                         return data
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                 except socket.timeout:
                     logger.warning("Socket timeout during chunked receive")
@@ -288,16 +305,16 @@ class SketchupConnection:
             if _looks_like_framed_response(data):
                 body = _extract_framed_body(data)
                 if body is None:
-                    raise Exception("Incomplete framed response received")
+                    raise ConnectionError("Incomplete framed response received")
                 return body
 
             try:
                 json.loads(data.decode('utf-8'))
                 return data
-            except json.JSONDecodeError:
-                raise Exception("Incomplete JSON response received")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise ConnectionError("Incomplete JSON response received")
         else:
-            raise Exception("No data received")
+            raise ConnectionError("No data received")
 
     def send_command(
         self,
@@ -371,9 +388,13 @@ class SketchupConnection:
                 "id": request_id
             }
         
+        replay_safe = request["params"]["name"] in REPLAY_SAFE_TOOLS
+        if not replay_safe:
+            max_retries = 0
         retry_count = 0
         
         while retry_count <= max_retries:
+            send_started = False
             try:
                 request["_mcp"] = {
                     "sent_at_ms": int(time.time() * 1000),
@@ -386,6 +407,8 @@ class SketchupConnection:
                 request_bytes = _frame_json_payload(request_body)
                 logger.info(f"Raw bytes being sent: {request_bytes}")
                 
+                self.sock.settimeout(effective_timeout_ms / 1000)
+                send_started = True
                 self.sock.sendall(request_bytes)
                 logger.info(f"Request sent, waiting for response...")
                 
@@ -398,21 +421,43 @@ class SketchupConnection:
                 logger.info(f"Response parsed: {response}")
 
                 if not isinstance(response, dict):
-                    return response
+                    raise ValueError("SketchUp returned a non-object response")
+                if "id" in response and response["id"] != request_id:
+                    raise ValueError("SketchUp response ID does not match the request")
 
                 if "error" in response:
                     logger.error(f"Sketchup error: {response['error']}")
-                    raise Exception(response["error"].get("message", "Unknown error from Sketchup"))
+                    raise RubyToolError(response["error"])
 
-                return response.get("result", {})
+                if "result" not in response:
+                    raise ValueError("SketchUp response did not contain a result")
+                result = response["result"]
+                if not isinstance(result, dict):
+                    raise ValueError("SketchUp tool result must be an object")
+                if result.get("isError") or result.get("success") is False:
+                    raise RubyToolError({"message": str(result.get("content", "SketchUp operation failed"))})
+                return result
                 
-            except (socket.timeout, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+            except OSError as e:
                 logger.warning(f"Connection error (attempt {retry_count+1}/{max_retries+1}): {str(e)}")
                 if isinstance(e, socket.timeout) and _request_prevents_modal_hang(request):
-                    modal = modal_guard.interrupt_modal_for_port(self.host, self.port, request_id=request_id)
+                    try:
+                        modal = modal_guard.interrupt_modal_for_port(self.host, self.port, request_id=request_id)
+                    except Exception as guard_error:
+                        self.disconnect()
+                        raise RequestOutcomeUnknown(
+                            "Request may still be executing; modal inspection failed. It was not replayed."
+                        ) from guard_error
                     if modal:
                         self.disconnect()
                         raise modal_guard.ModalGuardInterrupted(modal)
+
+                if send_started and not replay_safe:
+                    self.disconnect()
+                    raise RequestOutcomeUnknown(
+                        "Request may have executed in SketchUp; it was not replayed. "
+                        "Inspect the target model before retrying. " + str(e)
+                    ) from e
 
                 retry_count += 1
                 
@@ -421,21 +466,32 @@ class SketchupConnection:
                     self.disconnect()
                     if not self.connect(allow_autostart=allow_autostart):
                         logger.error("Failed to reconnect")
-                        break
+                        raise ConnectionError("Failed to reconnect to SketchUp") from e
                 else:
                     logger.error(f"Max retries reached, giving up")
-                    self.sock = None
+                    self.disconnect()
                     raise Exception(f"Connection to Sketchup lost after {max_retries+1} attempts: {str(e)}")
             
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON response from Sketchup: {str(e)}")
-                if 'response_data' in locals() and response_data:
-                    logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-                raise Exception(f"Invalid response from Sketchup: {str(e)}")
+            except (ValueError, UnicodeDecodeError) as e:
+                self.disconnect()
+                if send_started and not replay_safe:
+                    raise RequestOutcomeUnknown(
+                        "SketchUp returned an invalid response; request may have executed. "
+                        "It was not replayed. " + str(e)
+                    ) from e
+                raise
+
+            except RubyToolError:
+                self.disconnect()
+                raise
             
             except Exception as e:
                 logger.error(f"Error communicating with Sketchup: {str(e)}")
-                self.sock = None
+                self.disconnect()
+                if send_started and not replay_safe:
+                    raise RequestOutcomeUnknown(
+                        "Request may have executed; response processing failed. It was not replayed. " + str(e)
+                    ) from e
                 raise Exception(f"Communication error with Sketchup: {str(e)}")
 
 # Request-scoped connection routing
@@ -756,13 +812,46 @@ async def _send_ruby_tool_for_context(
     return await _send_ruby_tool(name, arguments, request_id, **kwargs)
 
 
-def _tool_error(exc: BaseException, port: Any = None, *, ctx: Any = None) -> str:
-    payload: Dict[str, Any] = {"success": False, "host": get_sketchup_host(), "error": str(exc)}
+def _tool_result(payload: Dict[str, Any]) -> CallToolResult:
+    """Expose the same JSON object to text and structured MCP consumers."""
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+        structuredContent=payload,
+        isError=payload.get("success") is False,
+    )
+
+
+def _error_payload(exc: BaseException, host: str, port: Any) -> Dict[str, Any]:
+    unknown = isinstance(exc, (RequestOutcomeUnknown, modal_guard.ModalGuardInterrupted))
+    details = exc.details if isinstance(exc, RubyToolError) else {}
+    data = details.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+    state = "unknown" if unknown else data.get("execution_state", "failed" if details else "not_started")
+    error = {
+        "code": "execution_unknown" if unknown else (
+            "ruby_error" if details else "invalid_argument" if isinstance(exc, ValueError) else "connection_error"
+        ),
+        "type": data.get("type", type(exc).__name__),
+        "message": str(exc),
+        "execution_state": state,
+        "retryable": state == "not_started" and not isinstance(exc, ValueError),
+    }
+    if "backtrace" in data:
+        error["backtrace"] = data["backtrace"]
+    payload = {"success": False, "result": None, "error": error, "target": {"host": host, "port": port}}
+    if isinstance(exc, modal_guard.ModalGuardInterrupted):
+        payload.update(exc.to_payload())
+        payload["error"] = error
+    return payload
+
+
+def _tool_error(exc: BaseException, port: Any = None, *, ctx: Any = None) -> CallToolResult:
     try:
-        payload["port"] = get_sketchup_port(port, ctx=ctx)
+        target_port = get_sketchup_port(port, ctx=ctx)
     except ValueError:
-        payload["port"] = port
-    return json.dumps(payload)
+        target_port = port
+    return _tool_result(_error_payload(exc, get_sketchup_host(), target_port))
 
 
 def _request_id(ctx: Context) -> Any:
@@ -770,13 +859,23 @@ def _request_id(ctx: Context) -> Any:
 
 
 def _result_text(result: Dict[str, Any]) -> Any:
+    if "value" in result:
+        return result["value"]
     content = result.get("content")
     if not isinstance(content, list) or not content:
-        raise ValueError("SketchUp response did not contain tool content")
+        raise RequestOutcomeUnknown("SketchUp response did not contain tool content; inspect execution before retrying")
     first = content[0]
     if not isinstance(first, dict) or "text" not in first:
-        raise ValueError("SketchUp response did not contain text content")
+        raise RequestOutcomeUnknown("SketchUp response did not contain text content; inspect execution before retrying")
     return first["text"]
+
+
+def _ruby_result(result: Dict[str, Any], target: Dict[str, Any]) -> CallToolResult:
+    payload = {"success": True, "result": _result_text(result), "target": target}
+    for key in ("ui_events", "resourceId"):
+        if result.get(key) is not None:
+            payload[key] = result[key]
+    return _tool_result(payload)
 
 
 def _get_instance_info_sync(port: Any = None, *, ctx: Any = None) -> Dict[str, Any]:
@@ -864,52 +963,49 @@ mcp = FastMCP(
 
 # Tool endpoints
 @mcp.tool()
-def allow_sketchup_autostart(ctx: Context, allowed: bool = True) -> str:
+def allow_sketchup_autostart(ctx: Context, allowed: bool = True) -> CallToolResult:
     """Allow only this MCP session to start SketchUp when its Ruby port is unreachable."""
     session = _session_from_context(ctx)
     startup.set_session_autostart_allowed(allowed, session=session)
-    return json.dumps({
+    return _tool_result({
         "success": True,
         "autostart_allowed": _autostart_allowed_for_context(ctx),
         "session_autostart_allowed": bool(allowed),
     })
 
 @mcp.tool()
-def set_connection_port(ctx: Context, port: int) -> str:
+def set_connection_port(ctx: Context, port: int) -> CallToolResult:
     """Set the default port used only when a SketchUp tool call omits port."""
     try:
         target_port = set_sketchup_port_override(port, ctx=ctx)
-        return json.dumps({
+        return _tool_result({
             "success": True,
             "host": get_sketchup_host(),
             "port": target_port,
         })
     except Exception as e:
-        return json.dumps({
-            "success": False,
-            "error": str(e),
-        })
+        return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
-async def get_instance_info(ctx: Context, port: int | None = None) -> str:
+async def get_instance_info(ctx: Context, port: int | None = None) -> CallToolResult:
     """Read a target SketchUp listener's identity and active-model fingerprint."""
     try:
         info = await asyncio.to_thread(_get_instance_info_sync, port, ctx=ctx)
-        return json.dumps({"success": True, "instance": info})
+        return _tool_result({"success": True, "instance": info})
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
-async def list_sketchup_instances(ctx: Context, ports: List[int] | None = None) -> str:
+async def list_sketchup_instances(ctx: Context, ports: List[int] | None = None) -> CallToolResult:
     """List registered local SketchUp listeners and explicitly supplied ports only."""
     try:
-        return json.dumps(await asyncio.to_thread(_list_sketchup_instances_sync, ports))
+        return _tool_result(await asyncio.to_thread(_list_sketchup_instances_sync, ports))
     except Exception as e:
-        return _tool_error(e)
+        return _tool_error(e, ctx=ctx)
 
 
 @mcp.tool()
-async def get_modal_state(ctx: Context, port: int | None = None) -> str:
+async def get_modal_state(ctx: Context, port: int | None = None) -> CallToolResult:
     """Inspect a target listener's SketchUp modal state without sending Ruby code."""
     try:
         target_port = get_sketchup_port(port, ctx=ctx)
@@ -919,13 +1015,14 @@ async def get_modal_state(ctx: Context, port: int | None = None) -> str:
             target_port,
             request_id=_request_id(ctx),
         )
-        return json.dumps(result)
+        result["target"] = {"host": get_sketchup_host(), "port": target_port}
+        return _tool_result(result)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
 
 @mcp.tool()
-async def close_modal(ctx: Context, port: int | None = None) -> str:
+async def close_modal(ctx: Context, port: int | None = None) -> CallToolResult:
     """Close a target listener's detected modal window without waiting for Ruby TCP work."""
     try:
         target_port = get_sketchup_port(port, ctx=ctx)
@@ -935,7 +1032,8 @@ async def close_modal(ctx: Context, port: int | None = None) -> str:
             target_port,
             request_id=_request_id(ctx),
         )
-        return json.dumps(result)
+        result["target"] = {"host": get_sketchup_host(), "port": target_port}
+        return _tool_result(result)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -946,17 +1044,17 @@ async def create_component(
     position: List[float] = None,
     dimensions: List[float] = None,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Create a component in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx,
             "create_component",
             {"type": type, "position": position or [0, 0, 0], "dimensions": dimensions or [1, 1, 1]},
             _request_id(ctx),
             port=port,
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -965,13 +1063,13 @@ async def delete_component(
     ctx: Context,
     id: str,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Delete a component from the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx, "delete_component", {"id": id}, _request_id(ctx), port=port
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -983,7 +1081,7 @@ async def transform_component(
     rotation: List[float] = None,
     scale: List[float] = None,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Transform a component in the requested SketchUp listener."""
     try:
         arguments = {"id": id}
@@ -993,19 +1091,19 @@ async def transform_component(
             arguments["rotation"] = rotation
         if scale is not None:
             arguments["scale"] = scale
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx, "transform_component", arguments, _request_id(ctx), port=port
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
 @mcp.tool()
-async def get_selection(ctx: Context, port: int | None = None) -> str:
+async def get_selection(ctx: Context, port: int | None = None) -> CallToolResult:
     """Get the selection from the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(ctx, "get_selection", {}, _request_id(ctx), port=port)
-        return json.dumps(result)
+        result, target = await _send_ruby_tool_for_context(ctx, "get_selection", {}, _request_id(ctx), port=port)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -1015,13 +1113,13 @@ async def set_material(
     id: str,
     material: str,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Set material in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx, "set_material", {"id": id, "material": material}, _request_id(ctx), port=port
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -1030,13 +1128,13 @@ async def export_scene(
     ctx: Context,
     format: str = "skp",
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Export the scene from the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx, "export", {"format": format}, _request_id(ctx), port=port
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -1049,7 +1147,7 @@ async def capture_review_views(
     width: int = 1600,
     height: int = 1200,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Capture review views from the requested SketchUp listener."""
     try:
         result, target = await _send_ruby_tool_for_context(
@@ -1070,7 +1168,7 @@ async def capture_review_views(
             "result": _result_text(result),
             "target": target,
         }
-        return json.dumps(response)
+        return _tool_result(response)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -1086,10 +1184,10 @@ async def create_mortise_tenon(
     offset_y: float = 0.0,
     offset_z: float = 0.0,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Create a mortise and tenon joint in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx,
             "create_mortise_tenon",
             {
@@ -1105,7 +1203,7 @@ async def create_mortise_tenon(
             _request_id(ctx),
             port=port,
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -1123,10 +1221,10 @@ async def create_dovetail(
     offset_y: float = 0.0,
     offset_z: float = 0.0,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Create a dovetail joint in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx,
             "create_dovetail",
             {
@@ -1144,7 +1242,7 @@ async def create_dovetail(
             _request_id(ctx),
             port=port,
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -1161,10 +1259,10 @@ async def create_finger_joint(
     offset_y: float = 0.0,
     offset_z: float = 0.0,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Create a finger joint in the requested SketchUp listener."""
     try:
-        result, _target = await _send_ruby_tool_for_context(
+        result, target = await _send_ruby_tool_for_context(
             ctx,
             "create_finger_joint",
             {
@@ -1181,7 +1279,7 @@ async def create_finger_joint(
             _request_id(ctx),
             port=port,
         )
-        return json.dumps(result)
+        return _ruby_result(result, target)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 
@@ -1191,7 +1289,7 @@ async def eval_ruby(
     code: str,
     prevent_modal_hang: bool = False,
     port: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Evaluate Ruby in the requested SketchUp listener."""
     try:
         arguments = {"code": code}
@@ -1207,12 +1305,9 @@ async def eval_ruby(
         }
         if "ui_events" in result:
             response["ui_events"] = result["ui_events"]
-        return json.dumps(response)
+        return _tool_result(response)
     except modal_guard.ModalGuardInterrupted as e:
-        payload = e.to_payload()
-        payload["host"] = get_sketchup_host()
-        payload["port"] = get_sketchup_port(port, ctx=ctx)
-        return json.dumps(payload)
+        return _tool_error(e, port, ctx=ctx)
     except Exception as e:
         return _tool_error(e, port, ctx=ctx)
 

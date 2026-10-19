@@ -349,6 +349,16 @@ Here are some examples of what you can ask your MCP client to do:
 
 ## Troubleshooting
 
+### Session recovery, timeouts, and results
+
+An expired HTTP session returns 404 for its old `Mcp-Session-Id`. The client must recreate its connection and initialize again instead of retrying the old session. The local dsh MCP supervisor implements this using its existing bounded reconnect policy; rebuild and load the patched dsh to use it. Session-selected ports and temporary autostart consent must be selected again after recovery. Always pass `port` explicitly when using multiple instances. Recovery never replays a failed tool call.
+
+The Python bridge only retries `ping`, `get_instance_info`, and `get_selection`. Once sending starts, arbitrary Ruby, model changes, and unknown tools are never replayed after timeout, disconnection, or an invalid response. They return `execution_unknown`, with `error.execution_state: "unknown"` and `retryable: false`. Inspect the target model before retrying: timeout does not cancel or roll back Ruby execution. Chunked reception uses a total deadline rather than extending the wait for each chunk.
+
+MCP tools return a native `structuredContent` object and an equivalent JSON text block, without a JSON-encoded string wrapper. Successful Ruby tools expose `success`, `result`, and `target`. Failures expose a structured `error` and MCP `isError: true`. Errors include `code`, `type`, `message`, `execution_state`, and `retryable`; Ruby exceptions also include their backtrace. CLI `eval` and `call` use the same result fields; failures go to stderr with a nonzero exit code.
+
+With the updated Ruby extension, `eval_ruby` preserves JSON objects, arrays, numbers, booleans, and null. Strings remain strings and other Ruby objects become text. Legacy extension text responses remain readable, but their lost types cannot be recovered. Selection results retain entity data and review captures return a paths object. Reload the Ruby extension or restart SketchUp, and restart the Python HTTP daemon to load changes. Passing source tests does not update already running clients or extensions.
+
 * **Connection issues**: Make sure both the Sketchup extension server and the MCP server are running
 * **Command failures**: Check the Ruby Console in Sketchup for error messages
 * **Timeout errors**: Try simplifying your requests or breaking them into smaller steps

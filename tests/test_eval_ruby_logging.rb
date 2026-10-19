@@ -1,5 +1,6 @@
 require "minitest/autorun"
 require "fileutils"
+require "json"
 require "tmpdir"
 
 RUBY_MAIN = File.expand_path("../su_mcp/su_mcp/main.rb", __dir__)
@@ -40,13 +41,9 @@ def extract_method_source(source, method_name, required: true)
   raise "method #{method_name} not found" if required && !start_index
   return nil unless start_index
 
-  depth = 0
+  indentation = lines[start_index][/\A\s*/]
   lines[start_index..].each_with_index do |line, offset|
-    stripped = line.strip
-    depth += 1 if stripped.match?(/\A(def|begin|case|class|module|if|unless|while|until|for)\b/) || stripped.match?(/\bdo\b/)
-    depth -= 1 if stripped.match?(/\Aend\b/)
-
-    return lines[start_index, offset + 1].join if depth.zero?
+    return lines[start_index, offset + 1].join if line.rstrip == "#{indentation}end"
   end
 
   raise "method #{method_name} end not found"
@@ -100,7 +97,9 @@ class EvalRubyLoggingTest < Minitest::Test
     append_eval_ruby_ui_event
     summarize_eval_ruby_ui_arg
     eval_ruby_ui_result_label
+    eval_ruby_json_value
     eval_ruby
+    handle_tool_call
   ].each do |method_name|
     method_source = extract_method_source(source, method_name, required: method_name == "eval_ruby")
     Harness.class_eval(method_source) if method_source
@@ -150,7 +149,7 @@ class EvalRubyLoggingTest < Minitest::Test
         harness.eval_ruby("code" => code)
       end
 
-      assert_equal "Ruby evaluation error: boom", error.message
+      assert_equal "boom", error.message
 
       log_files = Dir.children(dir).grep(/\.rb\z/).map { |name| File.join(dir, name) }
       assert_equal 1, log_files.length
@@ -180,6 +179,55 @@ class EvalRubyLoggingTest < Minitest::Test
     end
   end
 
+  def test_eval_ruby_preserves_json_types_and_legacy_text
+    Dir.mktmpdir do |dir|
+      harness = Harness.new(dir)
+      result = harness.eval_ruby("code" => '{"中文" => [1, false, nil]}')
+      assert_equal({ "中文" => [1, false, nil] }, result[:value])
+      assert_kind_of String, result[:result]
+      assert_nil harness.eval_ruby("code" => "nil")[:value]
+      assert_equal false, harness.eval_ruby("code" => "false")[:value]
+      assert_equal "42", harness.eval_ruby("code" => "'42'")[:value]
+    end
+  end
+
+  def test_eval_ruby_logs_and_preserves_syntax_errors
+    Dir.mktmpdir do |dir|
+      harness = Harness.new(dir)
+      assert_raises(SyntaxError) { harness.eval_ruby("code" => "def (") }
+      contents = File.read(Dir.glob(File.join(dir, "*.rb")).first, encoding: "UTF-8")
+      assert_includes contents, "# error_class: SyntaxError"
+    end
+  end
+
+  def test_eval_ruby_keeps_success_when_result_has_a_cycle
+    Dir.mktmpdir do |dir|
+      harness = Harness.new(dir)
+      ["a = []; a << a; a", "h = {}; h[:self] = h; h"].each do |code|
+        result = harness.eval_ruby("code" => code)
+        assert_equal true, result[:success]
+        assert_kind_of String, result[:value]
+        assert_equal result[:result], result[:value]
+      end
+    end
+  end
+
+  def test_tool_dispatch_preserves_values_selection_and_error_details
+    Dir.mktmpdir do |dir|
+      harness = Harness.new(dir)
+      request = { "id" => 1, "params" => { "name" => "eval_ruby", "arguments" => { "code" => "[false, nil]" } } }
+      assert_equal [false, nil], harness.handle_tool_call(request)[:result][:value]
+      request["params"]["arguments"]["code"] = "def ("
+      error = harness.handle_tool_call(request)[:error]
+      assert_equal "SyntaxError", error[:data][:type]
+      assert_equal "failed", error[:data][:execution_state]
+      refute_empty error[:data][:backtrace]
+      harness.define_singleton_method(:get_selection) { { success: true, entities: [{ id: 1 }] } }
+      request["params"]["name"] = "get_selection"
+      assert_equal({ entities: [{ id: 1 }] }, harness.handle_tool_call(request)[:result][:value])
+    end
+  end
+
   def test_eval_ruby_still_logs_brief_console_summary
     Dir.mktmpdir do |dir|
       harness = Harness.new(dir)
@@ -206,7 +254,7 @@ class EvalRubyLoggingTest < Minitest::Test
         harness.eval_ruby("code" => "UI.openpanel('Pick file')")
       end
 
-      assert_equal "Ruby evaluation error: original openpanel", error.message
+      assert_equal "original openpanel", error.message
     end
   ensure
     UI.singleton_class.remove_method(:openpanel) if UI.respond_to?(:openpanel)
@@ -282,7 +330,7 @@ class EvalRubyLoggingTest < Minitest::Test
         )
       end
 
-      assert_equal "Ruby evaluation error: boom", error.message
+      assert_equal "boom", error.message
       assert_equal original_method, UI.method(:openpanel)
       assert_equal "original", UI.openpanel("Pick file")
     end

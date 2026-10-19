@@ -75,7 +75,7 @@ class CliEvalTests(unittest.TestCase):
         self.assertEqual(sent["params"], {"code": "1 + 1"})
         self.assertEqual(sent["request_id"], 1)
         self.assertTrue(sent["disconnected"])
-        self.assertEqual(json.loads(stdout.getvalue()), {"success": True, "content": [{"text": "2"}]})
+        self.assertEqual(json.loads(stdout.getvalue()), {"success": True, "result": "2", "target": {"host": "127.0.0.1", "port": 9877}})
 
     def test_eval_can_enable_prevent_modal_hang(self):
         sent = {}
@@ -204,7 +204,7 @@ class CliEvalTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("port must be an integer from 1 to 65535", json.loads(stderr.getvalue())["error"])
+        self.assertIn("port must be an integer from 1 to 65535", json.loads(stderr.getvalue())["error"]["message"])
 
     def test_invalid_startup_timeout_returns_json_error(self):
         stdout = io.StringIO()
@@ -214,7 +214,24 @@ class CliEvalTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("startup timeout must be a positive number", json.loads(stderr.getvalue())["error"])
+        self.assertIn("startup timeout must be a positive number", json.loads(stderr.getvalue())["error"]["message"])
+
+    def test_unknown_execution_returns_structured_error_and_nonzero_exit(self):
+        from sketchup_mcp.server import RequestOutcomeUnknown
+        from unittest.mock import Mock
+        connection = Mock(host="localhost", port=9878)
+        connection.send_command.side_effect = RequestOutcomeUnknown("response lost")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(cli, "_connection", return_value=connection):
+            code = cli.main(["--port", "9878", "eval", "1"], stdout=stdout, stderr=stderr)
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["target"]["port"], 9878)
+        self.assertEqual(payload["error"]["code"], "execution_unknown")
+        self.assertFalse(payload["error"]["retryable"])
+        connection.send_command.assert_called_once()
+        connection.disconnect.assert_called_once()
 
 
 if __name__ == "__main__":

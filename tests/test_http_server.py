@@ -196,6 +196,27 @@ class HttpServerTests(unittest.TestCase):
                 self.assertTrue(tool_call.headers["content-type"].startswith("text/event-stream"))
 
             for session_id in (first_session, second_session):
+                for error in (None, server.RequestOutcomeUnknown("response lost")):
+                    with patch.object(server, "_send_ruby_tool", **(
+                        {"side_effect": error} if error else {"return_value": (
+                            {"value": {"中文": [False, None, 3]}}, {"host": "localhost", "port": 9877}
+                        )}
+                    )):
+                        response = client.post("/mcp", headers=headers(session_id), json={
+                            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                            "params": {"name": "eval_ruby", "arguments": {"code": "probe", "port": 9877}},
+                        })
+                    import json
+                    event = json.loads("\n".join(
+                        line[6:] for line in response.text.splitlines() if line.startswith("data: ")
+                    ))["result"]
+                    self.assertEqual(event["isError"], error is not None)
+                    payload = event["structuredContent"]
+                    self.assertEqual(json.loads(event["content"][0]["text"]), payload)
+                    if error:
+                        self.assertEqual(payload["error"]["execution_state"], "unknown")
+                    else:
+                        self.assertEqual(payload["result"], {"中文": [False, None, 3]})
                 terminated = client.delete(
                     "/mcp",
                     headers={

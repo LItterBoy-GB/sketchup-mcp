@@ -91,7 +91,7 @@ class RequestRoutingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(instance_registry, "load_registered_instances", return_value=registered),
             patch.object(server, "_get_instance_info_sync", side_effect=get_info),
         ):
-            response = json.loads(await server.list_sketchup_instances(None, ports=[9877]))
+            response = (await server.list_sketchup_instances(None, ports=[9877])).structuredContent
 
         self.assertCountEqual(calls, [9876, 9877])
         self.assertEqual(response["instances"][0]["port"], 9876)
