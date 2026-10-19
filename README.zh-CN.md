@@ -75,7 +75,9 @@ Bearer Token 必须保存到用户级环境变量 `SKETCHUP_MCP_HTTP_TOKEN`，�
 
 在仓库根目录的 PowerShell 中运行以下命令。`Install` 会创建或更新当前用户的登录计划任务并启动 daemon；其默认值是 `-AllowAutostart:$true`。
 
-计划任务直接启动 `.venv\Scripts\pythonw.exe`，不经过 PowerShell 或 CMD 控制台，因此登录启动、`Start` 和 `Restart` 都不会弹出或闪现黑框。升级旧任务后需重新执行一次 `Install`，仅执行 `Restart` 不会更新旧任务的启动入口。手动执行管理命令时已有的终端窗口不受影响。
+计划任务从 `.venv/pyvenv.cfg` 解析 Python 安装目录，校验其 `pythonw.exe` 的 PE 子系统确为 Windows GUI，再以 `-I -S scripts/run-http-daemon.pyw` 仅加载虚拟环境依赖。启动链不调用 PowerShell、CMD 或虚拟环境中的可执行文件。部分 uv 版本会把控制台程序命名为 `.venv\Scripts\pythonw.exe`；采用此入口后，重建虚拟环境不会重新引入黑框，也不受工作区启动器 Low Integrity 标签导致的日志写入失败影响。
+
+`Install`、`Start`、`Restart` 都会校验入口；`Start`、`Restart` 自动迁移现有 Python 模块任务，保留服务参数和 Token。若 `Start` 发现正在运行的任务入口需要迁移，会重启该任务。无法识别的旧 PowerShell 任务请带原配置参数重新执行 `Install`。更换底层 Python 安装后，执行 `Start` 或 `Restart` 更新任务中的解释器路径。手动执行管理命令时已有的终端窗口不受影响。
 
 ```powershell
 .\scripts\manage-http-daemon.ps1 Install

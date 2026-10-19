@@ -87,10 +87,18 @@ Run these commands from the repository root in PowerShell. `Install` creates
 or updates the current user's logon scheduled task and starts the daemon; its
 default is `-AllowAutostart:$true`.
 
-The scheduled task directly launches `.venv\Scripts\pythonw.exe`, without a
-PowerShell or CMD console, so logon, `Start`, and `Restart` do not flash a console
-window. Run `Install` once to upgrade an existing task; `Restart` alone retains
-its old launch action. An existing terminal used for management commands stays open.
+The scheduled task launches the base Python installation's GUI `pythonw.exe`
+(resolved from `.venv/pyvenv.cfg`) with `-I -S scripts/run-http-daemon.pyw`.
+It validates the executable's Windows GUI PE subsystem and loads only the venv's
+site-packages, without invoking PowerShell, CMD, or a venv executable. Some uv
+versions create a console-subsystem `.venv\Scripts\pythonw.exe`; rebuilding the
+venv therefore cannot reintroduce that console window or a workspace launcher's
+Low Integrity log-write failure. `Install`, `Start`, and `Restart` validate this
+entry point; `Start`/`Restart` migrate existing Python module tasks while preserving
+their service options and token. `Start` restarts an active task when its action
+changes. Unknown/older PowerShell task actions require `Install` with the intended
+options. After changing the base Python installation, run `Start` or `Restart` to
+refresh the registered interpreter path. An existing management terminal stays open.
 The console-free Python entry point reads the current user token from the registry
 on every launch. Bootstrap failures go to `%LOCALAPPDATA%\SketchUpMCP\logs\http-launcher.log`
 (1 MiB, three backups) and exit nonzero so Task Scheduler can retry.

@@ -36,7 +36,8 @@ $script:TaskName = "SketchUpMCP HTTP Bridge"
 $script:TaskPath = "\"
 $script:TokenEnvironmentVariable = "SKETCHUP_MCP_HTTP_TOKEN"
 $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
-$script:PythonPath = Join-Path $script:RepositoryRoot ".venv\Scripts\pythonw.exe"
+$script:PythonPath = $null
+$script:BootstrapPath = Join-Path $script:RepositoryRoot "scripts\run-http-daemon.pyw"
 $script:CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $script:DefaultLogPath = "%LOCALAPPDATA%\SketchUpMCP\logs\http-daemon.log"
 
@@ -137,8 +138,9 @@ function ConvertTo-TaskArgument {
 
 function Get-BridgePythonArguments {
     $arguments = @(
-        "-m",
-        "sketchup_mcp.http_daemon",
+        "-I",
+        "-S",
+        $script:BootstrapPath,
         "--http-port",
         $HttpPort.ToString([Globalization.CultureInfo]::InvariantCulture),
         "--sketchup-port",
@@ -166,9 +168,95 @@ function Get-BridgeTaskArguments {
 }
 
 function Assert-BridgeLaunchPrerequisites {
-    if (-not (Test-Path -LiteralPath $script:PythonPath -PathType Leaf)) {
-        throw "Expected virtual-environment launcher was not found: $script:PythonPath"
+    $configPath = Join-Path $script:RepositoryRoot '.venv\pyvenv.cfg'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+        throw "Missing $configPath. Recreate the virtual environment and install the project first."
     }
+    $homeLine = @(Get-Content -LiteralPath $configPath -Encoding UTF8 | Where-Object { $_ -match '^\s*home\s*=' })
+    if ($homeLine.Count -ne 1) {
+        throw "Expected one base Python home in $configPath."
+    }
+    $pythonHome = ($homeLine[0] -split '=', 2)[1].Trim()
+    if (-not [IO.Path]::IsPathRooted($pythonHome)) {
+        throw "Base Python home must be an absolute path in $configPath."
+    }
+    $script:PythonPath = Join-Path $pythonHome 'pythonw.exe'
+    # 不调用 venv 启动器：uv 可能把控制台 shim 命名为 pythonw.exe。
+    Assert-GuiPythonExecutable -Path $script:PythonPath
+    if (-not (Test-Path -LiteralPath $script:BootstrapPath -PathType Leaf)) {
+        throw "Missing HTTP bootstrap: $script:BootstrapPath"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $script:RepositoryRoot '.venv\Lib\site-packages') -PathType Container)) {
+        throw "Missing virtual-environment site-packages. Install the project first."
+    }
+}
+
+function Assert-GuiPythonExecutable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Base GUI Python was not found: $Path"
+    }
+    $stream = [IO.File]::OpenRead($Path)
+    $reader = [IO.BinaryReader]::new($stream)
+    try {
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5a4d) {
+            throw "Invalid Python PE header: $Path"
+        }
+        $stream.Position = 60
+        $peOffset = $reader.ReadUInt32()
+        if ([long]$peOffset + 94 -gt $stream.Length) {
+            throw "Truncated Python PE header: $Path"
+        }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x4550) { throw "Invalid Python PE signature: $Path" }
+        $stream.Position = $peOffset + 24
+        if ($reader.ReadUInt16() -notin @(0x10b, 0x20b)) { throw "Invalid Python optional header: $Path" }
+        $stream.Position = $peOffset + 24 + 68
+        if ($reader.ReadUInt16() -ne 2) {
+            throw "Python launcher is not a Windows GUI executable: $Path. Repair the base Python installation."
+        }
+    }
+    finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Get-BridgeTaskHttpPort {
+    param([Parameter(Mandatory = $true)]$Task)
+
+    if (@($Task.Actions).Count -ne 1 -or $Task.Actions[0].Arguments -notmatch '(?:^|\s)--http-port\s+(\d+)(?:\s|$)') {
+        throw "Unrecognized bridge task arguments. Run Install with the intended options."
+    }
+    $port = [int]$Matches[1]
+    if ($port -lt 1 -or $port -gt 65535) { throw "Invalid bridge task HTTP port: $port" }
+    return $port
+}
+
+function Update-BridgeTaskLauncher {
+    param([Parameter(Mandatory = $true)]$Task)
+
+    [void](Get-BridgeTaskHttpPort -Task $Task)
+    $oldAction = $Task.Actions[0]
+    $arguments = [string]$oldAction.Arguments
+    $bootstrapPrefix = '-I -S ' + (ConvertTo-TaskArgument -Value $script:BootstrapPath)
+    if ($arguments.StartsWith($bootstrapPrefix + ' ', [StringComparison]::OrdinalIgnoreCase)) {
+        $options = $arguments.Substring($bootstrapPrefix.Length)
+    }
+    elseif ($arguments -match '^\s*-m\s+sketchup_mcp\.http_(?:daemon|server)(?=\s)(.*)$') {
+        $options = $Matches[1]
+    }
+    else {
+        throw "Unrecognized bridge task launcher. Run Install with the intended options."
+    }
+    # 只迁移启动入口，完整保留原任务的端口、超时和 autostart 参数。
+    $newArguments = $bootstrapPrefix + $options
+    if ($oldAction.Execute -eq $script:PythonPath -and $arguments -ceq $newArguments -and
+        $oldAction.WorkingDirectory -eq $script:RepositoryRoot) { return $false }
+    $taskAction = New-ScheduledTaskAction -Execute $script:PythonPath -Argument $newArguments -WorkingDirectory $script:RepositoryRoot
+    Set-ScheduledTask -TaskName $script:TaskName -TaskPath $script:TaskPath -Action $taskAction | Out-Null
+    return $true
 }
 
 function Invoke-BridgeDaemon {
@@ -194,7 +282,7 @@ function Install-BridgeTask {
     $tokenCreated = Ensure-UserToken
     $existingTask = Get-BridgeTask
     if ($null -ne $existingTask) {
-        Stop-BridgeTask
+        Stop-BridgeTask -ForReplacement
         Wait-BridgeTaskStopped
     }
 
@@ -227,15 +315,32 @@ function Install-BridgeTask {
 
 function Start-BridgeTask {
     Assert-BridgeTaskInstalled
+    Assert-BridgeLaunchPrerequisites
+    $task = Get-BridgeTask
+    $changed = Update-BridgeTaskLauncher -Task $task
+    if ($changed -and (Test-BridgeTaskActiveState -Task $task)) {
+        Stop-BridgeTask
+        Wait-BridgeTaskStopped
+    }
     Start-ScheduledTask -TaskName $script:TaskName -TaskPath $script:TaskPath
     Write-Output "Started '$script:TaskName'."
 }
 
 function Stop-BridgeTask {
+    param([switch]$ForReplacement)
+
     Assert-BridgeTaskInstalled
-    # 在停止任务前记录父子关系；Windows 虚拟环境启动器退出后可能留下实际解释器。
-    $bridgeProcesses = @(Get-BridgeProcesses)
     $task = Get-BridgeTask
+    try {
+        $taskPort = Get-BridgeTaskHttpPort -Task $task
+    }
+    catch {
+        if (-not $ForReplacement) { throw }
+        # Install 明确替换旧任务；仅清理本仓库、此次安装指定端口的遗留进程。
+        $taskPort = $HttpPort
+    }
+    # 在停止任务前记录父子关系；Windows 虚拟环境启动器退出后可能留下实际解释器。
+    $bridgeProcesses = @(Get-BridgeProcesses -Port $taskPort)
     if (Test-BridgeTaskActiveState -Task $task) {
         # The exact task owns the bridge process; do not terminate unrelated Python processes.
         Stop-ScheduledTask -TaskName $script:TaskName -TaskPath $script:TaskPath
@@ -268,21 +373,31 @@ function Wait-BridgeTaskStopped {
 }
 
 function Restart-BridgeTask {
+    # 先验证新解释器和任务参数，再停止仍在运行的服务。
+    Assert-BridgeLaunchPrerequisites
+    Assert-BridgeTaskInstalled
+    [void](Update-BridgeTaskLauncher -Task (Get-BridgeTask))
     Stop-BridgeTask
     Wait-BridgeTaskStopped
     Start-BridgeTask
 }
 
 function Get-BridgeProcesses {
+    param([int]$Port = $HttpPort)
+
     $modulePattern = 'sketchup_mcp\.http_(?:daemon|server)'
-    $httpPortPattern = [regex]::Escape($HttpPort.ToString([Globalization.CultureInfo]::InvariantCulture))
+    $httpPortPattern = [regex]::Escape($Port.ToString([Globalization.CultureInfo]::InvariantCulture))
+    $bootstrapPattern = '(?i)(?:^|\s)-S\s+"?' + [regex]::Escape($script:BootstrapPath) + '"?(?=\s|$)'
     $candidates = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe'" |
         Where-Object {
-            $_.CommandLine -match "(?i)(?:^|\s)-m\s+$modulePattern(?:\s|$)" -and
+            ($_.CommandLine -match "(?i)(?:^|\s)-m\s+$modulePattern(?:\s|$)" -or $_.CommandLine -match $bootstrapPattern) -and
             $_.CommandLine -match "(?i)(?:^|\s)--http-port\s+$httpPortPattern(?:\s|$)"
         })
     $legacyPythonPath = Join-Path $script:RepositoryRoot '.venv\Scripts\python.exe'
-    $roots = @($candidates | Where-Object { $_.ExecutablePath -in @($script:PythonPath, $legacyPythonPath) })
+    $legacyPythonWPath = Join-Path $script:RepositoryRoot '.venv\Scripts\pythonw.exe'
+    $roots = @($candidates | Where-Object {
+        $_.ExecutablePath -in @($legacyPythonWPath, $legacyPythonPath) -or $_.CommandLine -match $bootstrapPattern
+    })
     # 先返回启动器的直接子进程，再返回启动器；不按名称批量清理 Python。
     $rootIds = @($roots | ForEach-Object { $_.ProcessId })
     @($candidates | Where-Object { $_.ParentProcessId -in $rootIds -and $_.ProcessId -notin $rootIds })
@@ -290,11 +405,13 @@ function Get-BridgeProcesses {
 }
 
 function Get-BridgeProcessIds {
-    return @(Get-BridgeProcesses | ForEach-Object { $_.ProcessId })
+    param([int]$Port = $HttpPort)
+    return @(Get-BridgeProcesses -Port $Port | ForEach-Object { $_.ProcessId })
 }
 
 function Get-HealthCheck {
-    $uri = "http://127.0.0.1:$HttpPort/healthz"
+    param([int]$Port = $HttpPort)
+    $uri = "http://127.0.0.1:$Port/healthz"
     try {
         $response = Invoke-WebRequest -Uri $uri -Method Get -TimeoutSec 3 -ErrorAction Stop
         return [PSCustomObject]@{
@@ -316,7 +433,8 @@ function Show-BridgeStatus {
     if ($null -ne $task) {
         $taskInfo = Get-ScheduledTaskInfo -TaskName $script:TaskName -TaskPath $script:TaskPath -ErrorAction SilentlyContinue
     }
-    $health = Get-HealthCheck
+    $taskPort = if ($null -ne $task) { Get-BridgeTaskHttpPort -Task $task } else { $HttpPort }
+    $health = Get-HealthCheck -Port $taskPort
 
     [PSCustomObject]@{
         TaskName = $script:TaskName
@@ -325,13 +443,13 @@ function Show-BridgeStatus {
         LastRunTime = if ($null -ne $taskInfo) { $taskInfo.LastRunTime } else { $null }
         NextRunTime = if ($null -ne $taskInfo) { $taskInfo.NextRunTime } else { $null }
         LastTaskResult = if ($null -ne $taskInfo) { $taskInfo.LastTaskResult } else { $null }
-        HttpEndpoint = "http://127.0.0.1:$HttpPort"
+        HttpEndpoint = "http://127.0.0.1:$taskPort"
         LogPath = $script:DefaultLogPath
         LauncherLogPath = "%LOCALAPPDATA%\SketchUpMCP\logs\http-launcher.log"
         Health = $health.Status
         HealthDetail = $health.Detail
         Token = if ([string]::IsNullOrWhiteSpace((Get-UserToken))) { "absent" } else { "present" }
-        BridgeProcessIds = (Get-BridgeProcessIds) -join ", "
+        BridgeProcessIds = (Get-BridgeProcessIds -Port $taskPort) -join ", "
     } | Format-List
 }
 
