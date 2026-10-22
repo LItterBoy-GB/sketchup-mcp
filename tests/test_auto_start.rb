@@ -5,7 +5,7 @@ MAIN_RB_PATH = File.expand_path("../su_mcp/su_mcp/main.rb", __dir__)
 
 def extract_method_source(source, method_name)
   lines = source.lines
-  start_index = lines.index { |line| line.match?(/^\s*def #{Regexp.escape(method_name)}\b/) }
+  start_index = lines.index { |line| line.match?(/^\s*def #{Regexp.escape(method_name)}(?=\s|\(|$)/) }
   raise "Method not found: #{method_name}" unless start_index
 
   depth = 0
@@ -43,6 +43,7 @@ class AutoStartHarness
   end
 
   def initialize
+    @main_thread = Thread.current
     @port = 12_345
     @running = false
     @logs = []
@@ -64,7 +65,7 @@ class AutoStartHarness
 end
 
 source = File.read(MAIN_RB_PATH, encoding: "UTF-8")
-%w[parse_port bind_available_server start_on_available_port].each do |method_name|
+%w[ensure_main_thread! parse_port bind_available_server start_on_available_port].each do |method_name|
   AutoStartHarness.class_eval(extract_method_source(source, method_name), MAIN_RB_PATH)
 end
 

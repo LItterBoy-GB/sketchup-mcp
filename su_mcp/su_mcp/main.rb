@@ -1,6 +1,7 @@
 require 'sketchup'
 require 'json'
 require 'socket'
+require 'thread'
 require 'fileutils'
 require 'tmpdir'
 require 'securerandom'
@@ -12,6 +13,10 @@ module SU_MCP
   class Server
     DEFAULT_PORT = 9876
     CLIENT_READ_TIMEOUT_SEC = 0.5
+    CLIENT_WRITE_TIMEOUT_SEC = 5.0
+    IO_WORKER_COUNT = 8
+    MAX_QUEUED_LOGS = 256
+    MAX_LOGS_PER_TICK = 32
     SETTINGS_NAMESPACE = "SU_MCP"
     SETTINGS_PORT_KEY = "port"
     INSTANCE_REGISTRY_SCHEMA_VERSION = 1
@@ -36,6 +41,12 @@ module SU_MCP
     attr_reader :port
 
     def initialize
+      @main_thread = Thread.current
+      @transport = nil
+      @tick_active = false
+      @starting = false
+      @stopping = false
+      @stop_requested = false
       @port = self.class.load_port
       @server = nil
       @running = false
@@ -67,6 +78,21 @@ module SU_MCP
     end
 
     def log(msg)
+      # 后台线程只排队日志，不能调用 SketchUp 控制台或其他 UI API。
+      if @main_thread && Thread.current != @main_thread
+        transport = Thread.current[:su_mcp_transport]
+        begin
+          transport[:logs].push(msg, true) if transport
+        rescue ThreadError
+          # 日志队列有上限；慢 UI 不应阻塞网络线程或无限占用内存。
+        end
+        return
+      end
+
+      write_console_log(msg)
+    end
+
+    def write_console_log(msg)
       begin
         SKETCHUP_CONSOLE.write("MCP: #{msg}\n")
       rescue
@@ -113,6 +139,9 @@ module SU_MCP
     end
 
     def set_port(port)
+      ensure_main_thread!
+      return false if @starting || @stopping
+
       new_port = parse_port(port)
       raise ArgumentError, "Port must be an integer from 1 to 65535." unless new_port
 
@@ -130,111 +159,51 @@ module SU_MCP
     end
 
     def start(server_socket = nil)
+      ensure_main_thread!
+      return false if @starting || @stopping
       return true if @running
-      
+
+      @starting = true
       begin
         log "Starting server on localhost:#{@port}..."
         initialize_eval_ruby_log
-        
+
         @server = server_socket || TCPServer.new('127.0.0.1', @port)
         log "Server created on port #{@port}"
         write_instance_registry
-        
-        @running = true
-        
-        @timer_id = UI.start_timer(0.1, true) {
-          begin
-            if @running
-              # Check for connection
-              ready = IO.select([@server], nil, nil, 0)
-              if ready
-                log "Connection waiting..."
-                client = @server.accept_nonblock
-                log "Client accepted"
-                
-                begin
-                  data = read_client_payload(client)
 
-                  if data
-                    log "Raw data: #{data.inspect}"
-                    begin
-                      # Parse the raw JSON first to check format
-                      raw_request = JSON.parse(data)
-                      log "Raw parsed request: #{raw_request.inspect}"
-
-                      # Extract the original request ID if it exists in the raw data
-                      original_id = nil
-                      if data =~ /"id":\s*(\d+)/
-                        original_id = $1.to_i
-                        log "Found original request ID: #{original_id}"
-                      end
-
-                      # Use the raw request directly without transforming it
-                      # Just ensure the ID is preserved if it exists
-                      request = raw_request
-                      if !request["id"] && original_id
-                        request["id"] = original_id
-                        log "Added missing ID: #{original_id}"
-                      end
-
-                      if request_expired?(request)
-                        log "Dropped expired request: #{request.inspect}"
-                        write_json_response(client, {
-                          jsonrpc: "2.0", id: request["id"],
-                          error: { code: -32001, message: "Request expired before execution",
-                                   data: { execution_state: "not_started", type: "RequestExpired" } }
-                        })
-                      else
-                        log "Processed request: #{request.inspect}"
-                        response = handle_jsonrpc_request(request)
-                        log "Sending response: #{response.inspect}"
-                        write_json_response(client, response)
-                        log "Response sent"
-                      end
-                    rescue JSON::ParserError => e
-                      log "JSON parse error: #{e.message}"
-                      error_response = {
-                        jsonrpc: "2.0",
-                        error: { code: -32700, message: "Parse error" },
-                        id: original_id
-                      }
-                      write_json_response(client, error_response)
-                    rescue StandardError => e
-                      log "Request error: #{e.message}"
-                      error_response = {
-                        jsonrpc: "2.0",
-                        error: { code: -32603, message: e.message },
-                        id: request ? request["id"] : original_id
-                      }
-                      write_json_response(client, error_response)
-                    end
-                  end
-                ensure
-                  client.close unless client.closed?
-                  log "Client closed"
-                end
-              end
-            end
-          rescue IO::WaitReadable
-            # Normal for accept_nonblock
-          rescue StandardError => e
-            log "Timer error: #{e.message}"
-            log e.backtrace.join("\n")
-          end
+        # 每轮启动独立持有 socket、队列和连接，旧线程不会消费重启后的请求。
+        transport = {
+          server: @server, running: true, requests: Queue.new,
+          logs: SizedQueue.new(MAX_QUEUED_LOGS), connections: {}, mutex: Mutex.new,
+          workers: []
         }
-        
+        @transport = transport
+        @running = true
+        IO_WORKER_COUNT.times do
+          transport[:workers] << Thread.new { io_worker_loop(transport) }
+        end
+        @timer_id = UI.start_timer(0.1, true) { main_tick(transport) }
+
         log "Server started and listening"
-        true
-        
+        !@stop_requested
       rescue StandardError => e
         log "Error: #{e.message}"
         log e.backtrace.join("\n")
         stop
         false
+      ensure
+        @starting = false
+        if @stop_requested
+          @stop_requested = false
+          stop
+        end
       end
     end
 
     def start_on_available_port(start_port = DEFAULT_PORT)
+      ensure_main_thread!
+      return false if @starting || @stopping
       return true if @running
 
       first_port = parse_port(start_port)
@@ -268,21 +237,171 @@ module SU_MCP
     end
 
     def stop
-      log "Stopping server..."
-      @running = false
-      
-      if @timer_id
-        UI.stop_timer(@timer_id)
-        @timer_id = nil
+      ensure_main_thread!
+      if @starting
+        # 启动中的控制台输出也会泵送消息；等启动栈退出再统一释放资源。
+        @stop_requested = true
+        return
       end
-      
-      @server.close if @server
-      @server = nil
-      remove_instance_registry
-      log "Server stopped"
+      return if @stopping
+
+      @stopping = true
+      begin
+        # 先分离旧资源；清理期间拒绝新的 start/stop/set_port 重入。
+        @running = false
+        transport = @transport
+        server = @server
+        timer_id = @timer_id
+        @transport = @server = @timer_id = nil
+        if transport
+          transport[:running] = false
+          connections = transport[:mutex].synchronize { transport[:connections].to_a }
+          connections.each do |client, reply|
+            reply << nil
+            client.close unless client.closed?
+          rescue IOError, SystemCallError
+          end
+        end
+        begin
+          server.close if server && !server.closed?
+        rescue IOError, SystemCallError => e
+          log "Failed to close listener: #{e.message}"
+        end
+
+        log "Stopping server..."
+        begin
+          UI.stop_timer(timer_id) if timer_id
+        rescue StandardError => e
+          log "Failed to stop timer: #{e.message}"
+        end
+        remove_instance_registry
+        log "Server stopped"
+        # 不在主线程 join/kill：关闭连接并唤醒回复队列，让 I/O 线程自行退出。
+      ensure
+        @stopping = false
+      end
     end
 
     private
+
+    def ensure_main_thread!
+      return if Thread.current == @main_thread
+
+      raise ThreadError, "MCP server lifecycle and dispatch must run on its SketchUp thread"
+    end
+
+    def io_worker_loop(transport)
+      Thread.current[:su_mcp_transport] = transport
+      while transport[:running]
+        begin
+          next unless IO.select([transport[:server]], nil, nil, 0.1)
+          client = transport[:server].accept_nonblock
+        rescue IO::WaitReadable
+          next
+        end
+        serve_client(client, transport)
+      end
+    rescue IOError, SystemCallError => e
+      log "I/O worker stopped: #{e.message}" if transport[:running]
+    rescue StandardError => e
+      log "I/O worker error: #{e.class}: #{e.message}"
+    ensure
+      Thread.current[:su_mcp_transport] = nil
+    end
+
+    def serve_client(client, transport)
+      reply = Queue.new
+      registered = transport[:mutex].synchronize do
+        if transport[:running]
+          transport[:connections][client] = reply
+          true
+        end
+      end
+      return unless registered
+
+      request = nil
+      data = read_client_payload(client)
+      return unless data && transport[:running]
+
+      begin
+        request = JSON.parse(data)
+        raise ArgumentError, "Request must be a JSON object" unless request.is_a?(Hash)
+
+        transport[:requests] << [request, reply]
+        response = reply.pop
+      rescue JSON::ParserError => e
+        log "JSON parse error: #{e.message}"
+        response = { jsonrpc: "2.0", id: nil,
+                     error: { code: -32700, message: "Parse error" } }
+      rescue StandardError => e
+        log "Request error: #{e.message}"
+        response = { jsonrpc: "2.0", id: request.is_a?(Hash) ? request["id"] : nil,
+                     error: { code: -32603, message: e.message } }
+      end
+      write_json_response(client, response) if response && transport[:running]
+    rescue StandardError => e
+      log "Client connection ended: #{e.class}: #{e.message}" if transport[:running]
+    ensure
+      transport[:mutex].synchronize { transport[:connections].delete(client) }
+      begin
+        client.close unless client.closed?
+      rescue IOError, SystemCallError
+      end
+    end
+
+    def main_tick(transport = @transport)
+      ensure_main_thread!
+      return if @tick_active || @starting || @stopping || !current_transport?(transport)
+
+      # 必须在日志输出前设置防重入状态；控制台、弹窗等可能在同一主线程重入定时器。
+      @tick_active = true
+      begin
+        flush_transport_logs(transport)
+        return unless current_transport?(transport)
+
+        begin
+          request, reply = transport[:requests].pop(true)
+        rescue ThreadError
+          return
+        end
+        response = dispatch_queued_request(request)
+        reply << response if transport[:running]
+      rescue StandardError, ScriptError => e
+        log "Timer error: #{e.class}: #{e.message}"
+        if reply && transport[:running]
+          reply << { jsonrpc: "2.0", id: request.is_a?(Hash) ? request["id"] : nil,
+                     error: { code: -32603, message: e.message } }
+        end
+      ensure
+        # 内层被拒绝的回调不会进入此 ensure，不能提前释放外层的执行状态。
+        @tick_active = false
+      end
+    end
+
+    def current_transport?(transport)
+      @running && transport && transport.equal?(@transport) && transport[:running]
+    end
+
+    def flush_transport_logs(transport)
+      # 每次回调限制日志量和请求数，避免一次清空队列长时间霸占 UI。
+      [transport[:logs].size, MAX_LOGS_PER_TICK].min.times do
+        break unless current_transport?(transport)
+        write_console_log(transport[:logs].pop(true))
+      rescue ThreadError
+        break
+      end
+    end
+
+    def dispatch_queued_request(request)
+      if request_expired?(request)
+        log "Dropped expired request: #{request.inspect}"
+        { jsonrpc: "2.0", id: request["id"],
+          error: { code: -32001, message: "Request expired before execution",
+                   data: { execution_state: "not_started", type: "RequestExpired" } } }
+      else
+        handle_jsonrpc_request(request)
+      end
+    end
 
     def parse_port(value)
       text = value.to_s.strip
@@ -560,11 +679,11 @@ module SU_MCP
     end
 
     def read_line_with_timeout(client, timeout_sec)
-      deadline = Time.now + timeout_sec
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_sec
       line = +""
 
       loop do
-        remaining = deadline - Time.now
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         return nil if remaining <= 0
         return nil unless IO.select([client], nil, nil, remaining)
 
@@ -584,11 +703,11 @@ module SU_MCP
     end
 
     def read_bytes_with_timeout(client, length, timeout_sec)
-      deadline = Time.now + timeout_sec
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_sec
       data = +""
 
       while data.bytesize < length
-        remaining = deadline - Time.now
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         if remaining <= 0
           log "Client request body timed out after #{data.bytesize}/#{length} bytes"
           return nil
@@ -613,9 +732,20 @@ module SU_MCP
 
     def write_json_response(client, response)
       body = response.to_json
-      client.write("Content-Length: #{body.bytesize}\r\n\r\n")
-      client.write(body)
-      client.flush
+      payload = "Content-Length: #{body.bytesize}\r\n\r\n".b + body.b
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + CLIENT_WRITE_TIMEOUT_SEC
+      offset = 0
+      while offset < payload.bytesize
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        raise IOError, "Client response write timed out" if remaining <= 0
+        raise IOError, "Client response write timed out" unless IO.select(nil, [client], nil, remaining)
+
+        begin
+          offset += client.write_nonblock(payload.byteslice(offset, payload.bytesize - offset))
+        rescue IO::WaitWritable
+          next
+        end
+      end
     end
 
     def request_expired?(request)

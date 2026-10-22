@@ -22,6 +22,10 @@ The system consists of two main components:
 1. **Sketchup Extension**: A Sketchup extension that creates a TCP server within Sketchup to receive and execute commands
 2. **MCP Server (`sketchup_mcp/server.py`)**: A Python server that implements the Model Context Protocol and connects to the Sketchup extension
 
+The Ruby extension uses a fixed pool of eight workers for socket I/O, preserving Content-Length framing and legacy single-line JSON input. Model and UI operations run on the main thread, with at most one request per timer tick. A reentry guard is set before console output. Request expiry checks, modal protection, instance registration, and Ruby session logs remain in place; stopping or restarting the listener isolates old queues and wakes waiting workers.
+
+The guard prevents nested MCP requests; it does not establish that another extension has finished running Ruby or interrupt an active script. Reads retain their existing timeouts, and response writes have a five-second total deadline. The bounded background diagnostic queue drops new messages when full; Ruby execution records continue to use the session log file.
+
 ## Installation
 
 ### Python MCP Server

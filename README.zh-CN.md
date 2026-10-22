@@ -23,6 +23,10 @@ SketchupMCP 用于连接 SketchUp 和 Codex、opencode 等 MCP 客户端，让�
 1. **SketchUp 扩展**：在 SketchUp 内启动一个 Ruby TCP server，用于接收并执行命令。
 2. **MCP Server (`sketchup_mcp/server.py`)**：Python MCP server，通过本地 TCP 连接到 SketchUp 扩展。
 
+Ruby 扩展使用固定的 8 个网络工作线程接收和回复请求，保留 `Content-Length` 分帧和旧版单行 JSON 输入。模型与 UI 操作仍在主线程执行，每次定时器回调最多处理一条请求，并在输出控制台日志前设置防重入状态。请求过期检查、弹窗保护、多实例登记及 Ruby 执行日志保持有效；停止或重启监听器会隔离旧队列并唤醒等待线程。
+
+防重入状态用于阻止 MCP 自身的请求嵌套，不代表其他插件的 Ruby 已执行结束，也不会中断已经执行中的脚本。网络读取保留原有超时，响应写入使用 5 秒总期限；后台诊断日志队列满时会丢弃新增日志，Ruby 执行记录仍保存在会话日志文件中。
+
 ## 安装
 
 ### Python MCP Server
